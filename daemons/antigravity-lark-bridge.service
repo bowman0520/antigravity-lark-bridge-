@@ -1,0 +1,18 @@
+[Unit]
+Description=Antigravity Feishu (Lark) Bridge Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=chiphen
+WorkingDirectory=/Users/chiphen/.agents/antigravity-lark-bridge
+ExecStart=/usr/bin/env node dist/cli.js run
+Restart=always
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=antigravity-lark-bridge
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
