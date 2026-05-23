@@ -11,6 +11,8 @@ A local bridge that connects Antigravity CLI with a Feishu/Lark bot. It lets you
 - Image download and optional compression before sending to Antigravity
 - Per-chat/session conversation state
 - Owner-only local runtime/config files
+- Encrypted local storage for app secrets
+- Doctor diagnostics, process registry, and user-level service helpers
 
 ## Requirements
 
@@ -82,10 +84,17 @@ antigravity-lark-bridge run
 
 If no config exists, the CLI starts a QR registration wizard:
 
-1. Scan the QR code with Feishu/Lark.
-2. The bridge saves a local config under `~/.antigravity-lark/config.json`.
-3. Follow the console links to enable the bot, scopes, WebSocket events, and release a version.
-4. Restart `antigravity-lark-bridge run` after changing app console settings if needed.
+1. Scan the QR code with the Feishu/Lark mobile app.
+2. The bridge registers an app and writes `~/.antigravity-lark/config.json`.
+3. The app secret is encrypted into the local keystore instead of being written as plaintext.
+4. The scanner's `open_id` is saved as the first admin when Feishu/Lark returns it.
+5. Follow the printed console links to finish app setup:
+   - enable the bot feature;
+   - grant scopes: `im:message.p2p_msg:readonly`, `im:message.group_at_msg:readonly`, `im:message:send_as_bot`;
+   - subscribe to `im.message.receive_v1`;
+   - set event receiving mode to WebSocket/persistent connection;
+   - release a version so the changes take effect.
+6. Restart `antigravity-lark-bridge run` after changing Feishu/Lark console settings if needed.
 
 You can use a custom config path:
 
@@ -105,6 +114,8 @@ By default the bridge stores local state in `~/.antigravity-lark`:
 - `logs/` — JSONL audit logs
 - `agy-logs/` — Antigravity CLI run logs
 - `media/` — downloaded chat images
+- `processes.json` — live bridge process registry
+- `secrets.enc` and `.keystore.salt` — encrypted local secret store
 
 Set `ANTIGRAVITY_LARK_HOME` to move this directory.
 
@@ -119,7 +130,20 @@ The generated config contains:
 - media and IPC limits
 - approval policy defaults
 
-Secret refs currently support plain values and environment variables:
+Secret refs support encrypted local secrets, environment variables, and legacy plain values:
+
+```json
+{
+  "lark": {
+    "appSecretRef": {
+      "source": "encrypted",
+      "id": "app-cli_xxx"
+    }
+  }
+}
+```
+
+For server/headless installs you can keep secrets in environment variables:
 
 ```json
 {
@@ -129,7 +153,7 @@ Secret refs currently support plain values and environment variables:
 }
 ```
 
-Encrypted local secret storage is planned for the next hardening step.
+If an old config contains a plaintext app secret, `run` migrates it into encrypted storage and rewrites the config. `env:` refs are preserved unchanged.
 
 ## Access control
 
@@ -141,16 +165,60 @@ For shared deployments, set `access.admins` and optionally restrict `allowedUser
 
 ## Chat commands
 
-Current commands include status/session/workspace operations and approval callbacks. The GitHub-ready roadmap adds safer `/new`, `/reset`, `/config`, and `/doctor` flows with admin gating.
+Common commands:
+
+- `/help` — show available commands.
+- `/status` — show current session/workspace status.
+- `/new` — start a fresh Antigravity conversation for the current chat.
+- `/reset` — clear stale running state for the current chat.
+- `/doctor` — run diagnostics and return a summary in chat.
+- `/stop` — stop the currently running task.
+- `/list` or `/ws` — list known workspaces/sessions where available.
+- `/reconnect` — reconnect the bridge WebSocket.
+
+Admin-sensitive commands are checked with `access.admins`. Empty `admins` preserves legacy unrestricted behavior, but QR-created configs set the scanner as admin by default.
+
+## Service and process commands
+
+The bridge has a process registry to detect duplicate bot processes for the same app. Useful host CLI commands:
+
+```bash
+antigravity-lark-bridge ps
+antigravity-lark-bridge kill <id-or-index>
+antigravity-lark-bridge status
+antigravity-lark-bridge start
+antigravity-lark-bridge stop
+antigravity-lark-bridge restart
+antigravity-lark-bridge unregister
+```
+
+Service commands generate user-level services:
+
+- macOS LaunchAgent
+- Linux systemd user service
+- Windows Task Scheduler task
+
+Run service commands from a stable install path, not a temporary `npx` directory, because service files store the CLI path.
 
 ## Troubleshooting
 
-- If `antigravity-lark-bridge doctor` reports that `agy` cannot be executed, install Antigravity CLI first or set `agent.command` to the actual CLI path/name.
+Run diagnostics first:
+
+```bash
+antigravity-lark-bridge doctor
+```
+
+Common issues:
+
+- If `doctor` reports that `agy` cannot be executed, install Antigravity CLI first or set `agent.command` to the actual CLI path/name.
 - If `agy --version` works but the bridge says Antigravity is not logged in, open Antigravity or log in to the CLI first.
+- If the first `agy` log contains early `You are not logged into Antigravity` lines but later says `silent auth succeeded`, those early lines are usually transient startup noise.
 - If quota is exhausted, the bridge returns a concise quota error instead of replaying old transcript output.
 - If group messages are ignored, mention the bot or set `reply.requireMentionInGroup` to `false`.
 - If image prompts are too large, reduce `media.maxImagesPerPrompt` or image size limits.
 - If the hook denies actions, check that `antigravity-lark-bridge run` is active and `runtime.json` exists.
+- If you see `Another bridge process is already running`, use `antigravity-lark-bridge ps` and `antigravity-lark-bridge kill <id-or-index>`, or stop the user service before running a foreground copy.
+- If a task card keeps showing `Antigravity 任务执行中` after the answer is visible, restart the bridge so it loads the latest build and check for `lark.update_task_progress_failed` in logs.
 
 ## Development
 
