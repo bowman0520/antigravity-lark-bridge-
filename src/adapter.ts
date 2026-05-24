@@ -49,6 +49,7 @@ const ALLOWED_STEP_TYPES = new Set<string>([
 ]);
 
 const TRANSCRIPT_SIZE_WARN_THRESHOLD = 5 * 1024 * 1024;
+const FINAL_TEXT_IDLE_MS = 20 * 1000;
 
 function getTranscriptPath(id: string): string {
   return path.join(getBrainDir(), id, '.system_generated', 'logs', 'transcript.jsonl');
@@ -142,6 +143,12 @@ export function runAgent(
     baselineBytes = getBaselineBytes(conversationId);
     lastReadOffset = baselineBytes;
     initialMaxStepIndex = getInitialMaxStepIndex(conversationId);
+    logger.info('agent.baseline_set', {
+      scope: input.scope,
+      conversationId,
+      baselineBytes,
+      initialMaxStepIndex,
+    });
     if (baselineBytes > TRANSCRIPT_SIZE_WARN_THRESHOLD) {
       logger.warn('agent.transcript_oversized', {
         scope: input.scope,
@@ -157,6 +164,7 @@ export function runAgent(
   const seenToolCallKeys = new Set<string>();
   let pollInterval: NodeJS.Timeout | null = null;
   let timeoutId: NodeJS.Timeout | null = null;
+  let finalTextWatchdog: NodeJS.Timeout | null = null;
   let isStopped = false;
   let isTimedOut = false;
   let isRunning = true;
@@ -392,6 +400,12 @@ export function runAgent(
         }
 
         if (data.tool_calls && Array.isArray(data.tool_calls)) {
+          // Tool activity means the model is still working — clear any pending
+          // "final text" watchdog so we don't kill the run mid-task.
+          if (finalTextWatchdog) {
+            clearTimeout(finalTextWatchdog);
+            finalTextWatchdog = null;
+          }
           data.tool_calls.forEach((tc: any, tcIdx: number) => {
             const toolId = `${stepIdx}-${tcIdx}`;
             const dedupKey = `${id}:${toolId}:${tc.name}`;
@@ -410,10 +424,20 @@ export function runAgent(
 
         if (data.content && (!data.tool_calls || data.tool_calls.length === 0)) {
           lastPlannerResponse = redactSecrets(data.content);
+          logger.info('agent.text_emit', {
+            scope: input.scope,
+            stepIdx,
+            contentPreview: lastPlannerResponse.slice(0, 60),
+          });
           onEvent({
             type: 'text',
             delta: lastPlannerResponse,
           });
+          // Arm a watchdog: if agy doesn't exit or emit a new step within
+          // FINAL_TEXT_IDLE_MS after a terminal text, force SIGTERM. Some
+          // agy --print invocations have been observed to hang after the
+          // final PlannerResponse without ever closing stdio.
+          armFinalTextWatchdog();
         }
       } else {
         const rawTypeName = type.toLowerCase().replace(/_/g, '');
@@ -454,6 +478,29 @@ export function runAgent(
       clearTimeout(timeoutId);
       timeoutId = null;
     }
+    if (finalTextWatchdog) {
+      clearTimeout(finalTextWatchdog);
+      finalTextWatchdog = null;
+    }
+  }
+
+  function armFinalTextWatchdog() {
+    if (finalTextWatchdog) clearTimeout(finalTextWatchdog);
+    finalTextWatchdog = setTimeout(() => {
+      if (isSettled) return;
+      logger.warn('agent.final_text_idle_kill', {
+        scope: input.scope,
+        idleMs: FINAL_TEXT_IDLE_MS,
+        hint: 'agy emitted final text but did not exit; forcing SIGTERM',
+      });
+      try {
+        child.kill('SIGTERM');
+      } catch (e) {}
+      setTimeout(() => {
+        if (isSettled) return;
+        try { child.kill('SIGKILL'); } catch (e) {}
+      }, 2000);
+    }, FINAL_TEXT_IDLE_MS);
   }
 
   return handle;

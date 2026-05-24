@@ -4,6 +4,8 @@ export interface QueuedPrompt {
   msgId: string;
   senderId: string;
   enqueuedAt: number;
+  batchPrompts?: string[];
+  batchMsgIds?: string[];
 }
 
 export class PromptQueue {

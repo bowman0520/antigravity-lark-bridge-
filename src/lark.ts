@@ -12,6 +12,7 @@ import { getMediaChatDir } from './paths';
 import { prepareImageForAgent, PreparedImage } from './media';
 import { limitAgentPrompt, truncateMiddle } from './payload';
 import { PromptQueue, QueuedPrompt } from './promptQueue';
+import { PendingQueue } from './pending-queue';
 import { reduce, initialState, finalizeIfRunning, markIdleTimeout, markInterrupted, renderCard, renderText, toLarkMarkdown, RunState } from './card';
 import { isAdmin, isChatAllowed, isUserAllowed } from './access';
 import { formatDoctorChecks, runDoctor } from './doctor';
@@ -30,6 +31,14 @@ interface ActiveRun {
 }
 
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const PENDING_DEBOUNCE_MS = 400;
+
+interface PendingPrompt {
+  prompt: string;
+  msgId: string;
+  senderId: string;
+  enqueuedAt: number;
+}
 
 export class LarkGateway {
   private client: Lark.Client;
@@ -38,6 +47,7 @@ export class LarkGateway {
   private processedMessageIds: Set<string> = new Set();
   private eventDispatcher: Lark.EventDispatcher;
   private promptQueue = new PromptQueue();
+  private pendingQueue: PendingQueue<PendingPrompt>;
   private agentUnavailableUntil = 0;
   private agentUnavailableMessage = '';
   private taskUpdateVersions = new Map<string, number>();
@@ -46,6 +56,10 @@ export class LarkGateway {
 
   constructor(config: ResolvedConfig) {
     this.config = config;
+
+    this.pendingQueue = new PendingQueue<PendingPrompt>(PENDING_DEBOUNCE_MS, (scope, batch) => {
+      void this.handlePendingFlush(scope, batch);
+    });
 
     this.client = new Lark.Client({
       appId: config.lark.appId,
@@ -211,11 +225,6 @@ export class LarkGateway {
       return;
     }
 
-    if (this.looksLikeStatusProbe(text)) {
-      await this.replyText(msgId, this.buildRuntimeStatusText(scope, session));
-      return;
-    }
-
     // Normal natural language Prompt
     await this.enqueuePrompt(text, scope, msgId, senderId);
   }
@@ -345,37 +354,21 @@ export class LarkGateway {
     return /^(hi|hello|hey|哈喽|哈啰|你好|您好|在吗|在不|在么|早|早上好|中午好|下午好|晚上好|嗨|喂|测试|test|ping)[。.!！~～]*$/.test(normalized);
   }
 
-  private looksLikeStatusProbe(text: string): boolean {
-    const normalized = text.replace(/[\s，。！？!?～~…,.]+/g, '').trim();
-    if (!normalized) return false;
-    if (/^(\?|？)+$/.test(normalized)) return true;
-    if (/^(还是)?(不行|没反应|没有反应|卡住了|卡了吗|还在吗|咋没反应|怎么没反应|啥情况|什么情况|无响应|停住了|还没好吗|好了没|好了吗)[啊哦呀呢吗嘛吧]*$/.test(normalized)) return true;
-    if (normalized.length <= 16 && /(没反应|没有反应|卡住|无响应|不行|啥情况|什么情况)/.test(normalized)) return true;
-    return false;
-  }
-
-  private buildRuntimeStatusText(scope: string, session: Session): string {
-    const activeRun = this.activeRuns.get(scope);
-    if (!activeRun) {
-      return `📊 Antigravity Bridge 状态\n\n当前没有正在运行的任务。\n工作区: \`${session.workspace}\`\n会话 ID: \`${session.conversationId || 'none'}\`\n\n如果要开始新上下文，可以发送 /new；如果要诊断连接，可以发送 /status 或 /doctor。`;
-    }
-
-    const elapsed = this.formatDuration(Math.max(0, Math.round((Date.now() - activeRun.startedAt) / 1000)));
-    const idle = this.formatDuration(Math.max(0, Math.round((Date.now() - activeRun.lastActivityAt) / 1000)));
-    const pidText = activeRun.runHandle.pid ? `PID ${activeRun.runHandle.pid}` : 'PID 未知';
-    return `📊 Antigravity Bridge 状态\n\n当前任务仍在运行。\n已运行: ${elapsed}\n最近进展: ${idle} 前\n进程: ${pidText}\n工作区: \`${session.workspace}\`\n\n可发送 /stop 终止当前任务，或发送 /new 中断并开启新会话。`;
-  }
-
-  private buildContextualAgentPrompt(userPrompt: string, scope: string, senderId: string, session: Session): string {
-    const isChitChat = this.isPureChitChat(userPrompt);
+  private buildContextualAgentPrompt(userPrompts: string | string[], scope: string, senderId: string, session: Session): string {
+    const promptArr = Array.isArray(userPrompts) ? userPrompts : [userPrompts];
+    const userPrompt = promptArr.join('\n\n');
+    const isChitChat = promptArr.length === 1 && this.isPureChitChat(promptArr[0]);
     const recentContext = !isChitChat && session.recentMessages.length > 0
       ? `<recent_messages>\n${session.recentMessages.slice(-8).join('\n')}\n</recent_messages>`
       : '';
-    const shortReplyHint = this.isContextDependentReply(userPrompt)
+    const shortReplyHint = promptArr.length === 1 && this.isContextDependentReply(promptArr[0])
       ? '用户当前消息很短，必须优先结合最近对话判断它是在选择、确认、追问、催办还是要求切换语言；不要把它当成孤立的新任务。'
       : '';
     const chitChatHint = isChitChat
       ? '用户只是在打招呼或简单测试连通性。请用一两句话简短回应即可，不要主动检索代码、读取文件、运行命令或开启任何新任务。'
+      : '';
+    const batchHint = promptArr.length > 1
+      ? `用户在很短时间内连续发了 ${promptArr.length} 条消息，已合并为一次请求（按时间顺序，用空行分隔）。请把它们视为同一意图的补充/纠正，整体回复一次即可，不要逐条复述。`
       : '';
     const conversationText = session.conversationId || 'none';
 
@@ -384,6 +377,7 @@ export class LarkGateway {
       'bot_name: 陈陈',
       'channel: feishu',
       `scope: ${scope}`,
+      `chat_id: ${scope.split(':')[1] || ''}`,
       `sender_id: ${senderId}`,
       `workspace: ${session.workspace}`,
       `conversation_id: ${conversationText}`,
@@ -396,8 +390,11 @@ export class LarkGateway {
       '不要把孤立的数字、同意、继续、用中文、问号、好了没当成全新需求；它们通常是在回应上一轮选项或追问上一轮任务。',
       'recent_messages 只是上下文参考，绝不可因为里面在讨论某个代码任务，就主动重新检索、读取文件、运行命令或重启那个任务。是否要执行工具，只看当前的 <user_message> 是不是明确要求执行。',
       '当 <user_message> 内容很短或只是打招呼/确认/感叹（如 hi、你好、在吗、收到、好的、谢谢）时，只用一两句话简短回复，禁止主动调用任何工具。',
+      '当用户表达抱怨、疑问或闲聊（如"卡住了吗"、"什么情况"、"为啥还没好"、"能不能..."），先直接用对话回应；不要主动读代码、跑命令、翻 bridge 实现去排查，除非用户明确说"帮我看一下代码"或"调试一下"。',
+      '【发送图片/文件/视频到飞书】生成或准备好本地文件后，必须用 lark-cli 主动发到当前对话，不要只在文本里写 ![](file://...)。命令模板：`lark-cli im +messages-send --chat-id <chat_id> --media-path <绝对路径>`，其中 chat_id 取自 bridge_context.chat_id。发完之后简短一句话告诉用户已发送即可，不要再贴本地路径。',
       shortReplyHint,
       chitChatHint,
+      batchHint,
       '</bridge_instructions>',
       recentContext,
       '<user_message>',
@@ -414,18 +411,40 @@ export class LarkGateway {
       return;
     }
 
-    if (this.promptQueue.isActive(scope) || session.status === 'RUNNING' || session.status === 'AWAITING_APPROVAL') {
-      const clearedStaleRun = this.clearStaleRunIfNeeded(session, scope);
-      if (!clearedStaleRun) {
-        const queueSize = this.promptQueue.push({ prompt, scope, msgId, senderId });
-        session.pendingQueue = this.promptQueue.snapshot(scope);
-        await this.replyText(msgId, `已收到，当前任务还在运行。你的消息已加入队列，前面还有 ${queueSize} 条待处理。需要中断当前任务可发 /stop。`);
-        await this.noteQueuedPrompt(session, queueSize);
-        return;
-      }
+    const isRunning = this.promptQueue.isActive(scope) || session.status === 'RUNNING' || session.status === 'AWAITING_APPROVAL';
+    let runActive = isRunning;
+    if (isRunning) {
+      const cleared = this.clearStaleRunIfNeeded(session, scope);
+      if (cleared) runActive = false;
     }
 
-    this.promptQueue.unshift({ prompt, scope, msgId, senderId });
+    if (runActive) {
+      // Block the debounce timer so we don't flush mid-run; we'll unblock when the current batch finishes.
+      // (We intentionally skip a visible ack here — flush will reply once the current run completes.)
+      this.pendingQueue.block(scope);
+    }
+
+    this.pendingQueue.push(scope, { prompt, msgId, senderId, enqueuedAt: Date.now() });
+    session.pendingQueue = this.snapshotPending(scope);
+  }
+
+  private snapshotPending(scope: string): string[] {
+    const n = this.pendingQueue.size(scope);
+    if (n === 0) return [];
+    return [`(pending batch, ${n} message${n > 1 ? 's' : ''})`];
+  }
+
+  private async handlePendingFlush(scope: string, batch: PendingPrompt[]) {
+    if (batch.length === 0) return;
+    // Push the entire batch as a single queued unit, then drain.
+    this.promptQueue.push({
+      prompt: '',  // unused; batch carried via batchPrompts
+      scope,
+      msgId: batch[batch.length - 1].msgId,  // anchor: last user message
+      senderId: batch[batch.length - 1].senderId,
+      batchPrompts: batch.map(b => b.prompt),
+      batchMsgIds: batch.map(b => b.msgId),
+    } as any);
     await this.drainPromptQueue(scope);
   }
 
@@ -446,14 +465,18 @@ export class LarkGateway {
       if (session) {
         session.pendingQueue = [];
       }
+      // Unblock the debounce queue so any messages that arrived during the run can flush.
+      this.pendingQueue.unblock(scope);
     }
   }
 
   private async processPrompt(item: QueuedPrompt) {
-    const { prompt, scope, msgId, senderId } = item;
+    const { scope, msgId, senderId } = item;
+    const batchPrompts: string[] = (item as any).batchPrompts || [item.prompt];
     const session = sessionManager.getOrCreateSession(scope, this.config.agent.defaultWorkspace);
-    const rawPrompt = prompt.replace(/^\/(task|long)\s+/, '').trim();
-    const contextualPrompt = this.buildContextualAgentPrompt(rawPrompt, scope, senderId, session);
+    const rawPrompts = batchPrompts.map(p => p.replace(/^\/(task|long)\s+/, '').trim()).filter(Boolean);
+    const rawPrompt = rawPrompts.join('\n\n');
+    const contextualPrompt = this.buildContextualAgentPrompt(rawPrompts, scope, senderId, session);
     const limitedPrompt = limitAgentPrompt(contextualPrompt, this.config.media.maxPromptChars);
     if (limitedPrompt.truncated) {
       logger.warn('prompt.truncated', {
@@ -625,6 +648,7 @@ export class LarkGateway {
     }
 
     this.promptQueue.clear(scope);
+    this.pendingQueue.cancel(scope);
     if (session) session.pendingQueue = [];
     this.cancelPendingApprovals(scope, `Task interrupted: ${reason}.`);
 
