@@ -13,6 +13,7 @@ jest.mock('fs', () => {
     ...actualFs,
     existsSync: jest.fn(),
     readFileSync: jest.fn(),
+    readdirSync: jest.fn(),
   };
 });
 
@@ -82,8 +83,14 @@ describe('Agent Adapter Tests', () => {
     (spawn as jest.Mock).mockReturnValue(mockChild);
 
     // Default fs implementation redirects to actual fs
-    (fs.existsSync as jest.Mock).mockImplementation((p) => actualFs.existsSync(p));
+    (fs.existsSync as jest.Mock).mockImplementation((p) => {
+      if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
+        return false;
+      }
+      return actualFs.existsSync(p);
+    });
     (fs.readFileSync as jest.Mock).mockImplementation((p, opt) => actualFs.readFileSync(p, opt));
+    (fs.readdirSync as jest.Mock).mockImplementation(() => []);
   });
 
   afterEach(() => {
@@ -149,6 +156,66 @@ describe('Agent Adapter Tests', () => {
     const result = await handle.promise;
     expect(result).toBe('This is the output from agent.');
     expect(handle.isRunning()).toBe(false);
+  });
+
+  test('runAgent ignores transcript lines older than startedAt - 5000', async () => {
+    const onEvent = jest.fn();
+    const handle = runAgent(
+      {
+        scope: 'p2p:user_1',
+        workspace: '/tmp',
+        prompt: 'hello world',
+      },
+      mockConfig,
+      onEvent
+    );
+
+    mockChild.stdout.emit('data', Buffer.from('{"conversationId": "conv_abc"}'));
+
+    (fs.existsSync as jest.Mock).mockImplementation((p) => {
+      if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
+        return true;
+      }
+      return actualFs.existsSync(p);
+    });
+
+    const oldTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const newTime = new Date().toISOString();
+
+    const mockTranscriptLines = [
+      JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        step_index: 0,
+        created_at: oldTime,
+        content: 'Old historical output.',
+      }),
+      JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        step_index: 1,
+        created_at: newTime,
+        content: 'New active output.',
+      })
+    ].join('\n') + '\n';
+
+    (fs.readFileSync as jest.Mock).mockImplementation((p, opt) => {
+      if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
+        return mockTranscriptLines;
+      }
+      return actualFs.readFileSync(p, opt);
+    });
+
+    jest.advanceTimersByTime(1000);
+
+    expect(onEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+      delta: 'Old historical output.',
+    }));
+    expect(onEvent).toHaveBeenCalledWith({
+      type: 'text',
+      delta: 'New active output.',
+    });
+
+    mockChild.emit('close', 0);
+    await handle.promise;
   });
 
   test('runAgent with sessionId uses send-message command', () => {

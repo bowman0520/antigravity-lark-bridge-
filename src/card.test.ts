@@ -61,7 +61,7 @@ describe('Card Module Tests', () => {
     expect(cardObj.header.title.content).toBe('Antigravity 任务执行中');
     expect(cardObj.header.template).toBe('blue');
 
-    const panel = cardObj.body.elements[0];
+    const panel = cardObj.elements[0];
     expect(panel.tag).toBe('collapsible_panel');
     expect(panel.header.title.content).toContain('RunCommand');
   });

@@ -26,6 +26,69 @@ export interface AgentRunHandle {
   stop: () => Promise<void>;
 }
 
+const ALLOWED_STEP_TYPES = new Set<string>([
+  'PLANNER_RESPONSE',
+  'RUN_COMMAND',
+  'VIEW_FILE',
+  'WRITE_TO_FILE',
+  'REPLACE_FILE_CONTENT',
+  'MULTI_REPLACE_FILE_CONTENT',
+  'GREP_SEARCH',
+  'LIST_DIR',
+  'LIST_DIRECTORY',
+  'SEARCH_WEB',
+  'READ_URL_CONTENT',
+  'INVOKE_SUBAGENT',
+  'SEND_MESSAGE',
+  'MANAGE_SUBAGENTS',
+  'MANAGE_TASK',
+  'SCHEDULE',
+  'ASK_PERMISSION',
+  'ASK_QUESTION',
+  'GENERATE_IMAGE',
+]);
+
+const TRANSCRIPT_SIZE_WARN_THRESHOLD = 5 * 1024 * 1024;
+
+function getTranscriptPath(id: string): string {
+  return path.join(getBrainDir(), id, '.system_generated', 'logs', 'transcript.jsonl');
+}
+
+function getInitialMaxStepIndex(id: string): number {
+  const transcriptPath = getTranscriptPath(id);
+  if (fs.existsSync(transcriptPath)) {
+    try {
+      const rawContent = fs.readFileSync(transcriptPath, 'utf8');
+      const rawLines = rawContent.split('\n');
+      let maxIndex = -1;
+      for (const line of rawLines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const data = JSON.parse(trimmed);
+          if (typeof data.step_index === 'number') {
+            maxIndex = Math.max(maxIndex, data.step_index);
+          }
+        } catch (e) {}
+      }
+      return maxIndex;
+    } catch (err) {
+      logger.warn('Failed to read transcript for initial max step index', { error: err });
+    }
+  }
+  return -1;
+}
+
+function getBaselineBytes(id: string): number {
+  const transcriptPath = getTranscriptPath(id);
+  if (!fs.existsSync(transcriptPath)) return 0;
+  try {
+    return fs.statSync(transcriptPath).size;
+  } catch {
+    return 0;
+  }
+}
+
 export function runAgent(
   input: AgentInput,
   config: ResolvedConfig,
@@ -71,22 +134,27 @@ export function runAgent(
 
   let conversationId: string | null = input.sessionId || null;
   let lastPlannerResponse = '';
-  let processedLines = 0;
+  let baselineBytes = 0;
+  let lastReadOffset = 0;
+  let initialMaxStepIndex = -1;
 
   if (conversationId) {
-    const transcriptPath = path.join(getBrainDir(), conversationId, '.system_generated', 'logs', 'transcript.jsonl');
-    if (fs.existsSync(transcriptPath)) {
-      try {
-        const rawContent = fs.readFileSync(transcriptPath, 'utf8');
-        const rawLines = rawContent.split('\n');
-        processedLines = Math.max(0, rawLines.length - 1);
-      } catch (err) {
-        logger.warn('Failed to read transcript for initial line count', { error: err });
-      }
+    baselineBytes = getBaselineBytes(conversationId);
+    lastReadOffset = baselineBytes;
+    initialMaxStepIndex = getInitialMaxStepIndex(conversationId);
+    if (baselineBytes > TRANSCRIPT_SIZE_WARN_THRESHOLD) {
+      logger.warn('agent.transcript_oversized', {
+        scope: input.scope,
+        conversationId,
+        bytes: baselineBytes,
+        threshold: TRANSCRIPT_SIZE_WARN_THRESHOLD,
+        hint: 'consider /new to start a fresh conversation',
+      });
     }
   }
 
   const processedStepIndices = new Set<number>();
+  const seenToolCallKeys = new Set<string>();
   let pollInterval: NodeJS.Timeout | null = null;
   let timeoutId: NodeJS.Timeout | null = null;
   let isStopped = false;
@@ -232,6 +300,13 @@ export function runAgent(
     handle.conversationId = id;
     sessionManager.setConversationId(input.scope, id);
     logger.info('agent.conversation_identified', { scope: input.scope, conversationId: id });
+    if (initialMaxStepIndex === -1) {
+      initialMaxStepIndex = getInitialMaxStepIndex(id);
+    }
+    if (baselineBytes === 0 && lastReadOffset === 0) {
+      baselineBytes = getBaselineBytes(id);
+      lastReadOffset = baselineBytes;
+    }
     startPollingTranscript(id);
   }
 
@@ -243,94 +318,130 @@ export function runAgent(
   }
 
   function pollTranscript(id: string) {
-    const brainDir = getBrainDir();
-    const transcriptPath = path.join(brainDir, id, '.system_generated', 'logs', 'transcript.jsonl');
+    const transcriptPath = getTranscriptPath(id);
 
     if (!fs.existsSync(transcriptPath)) {
       return;
     }
 
+    let chunk = '';
     try {
-      const rawContent = fs.readFileSync(transcriptPath, 'utf8');
-      const rawLines = rawContent.split('\n');
-      const completeLines = rawLines.slice(0, -1);
-
-      for (let i = processedLines; i < completeLines.length; i++) {
-        const line = completeLines[i].trim();
-        if (!line) continue;
-        try {
-          const data = JSON.parse(line);
-          processedLines = i + 1;
-
-          const type = String(data.type || '').toUpperCase();
-          if (type === 'PLANNER_RESPONSE') {
-            const stepIdx = data.step_index;
-            if (!processedStepIndices.has(stepIdx)) {
-              processedStepIndices.add(stepIdx);
-
-              // 1. Check reasoning / thinking
-              if (data.thinking) {
-                onEvent({
-                  type: 'thinking',
-                  delta: redactSecrets(data.thinking),
-                });
-              }
-
-              // 2. Check tool calls
-              if (data.tool_calls && Array.isArray(data.tool_calls)) {
-                data.tool_calls.forEach((tc: any, tcIdx: number) => {
-                  const toolId = `${stepIdx}-${tcIdx}`;
-                  const mappedName = mapToolName(tc.name);
-                  pendingToolCalls.push({ id: toolId, name: tc.name });
-                  onEvent({
-                    type: 'tool_use',
-                    id: toolId,
-                    name: mappedName,
-                    input: tc.args,
-                  });
-                });
-              }
-
-              // 3. Check planner text content (final response or text output)
-              if (data.content && (!data.tool_calls || data.tool_calls.length === 0)) {
-                lastPlannerResponse = redactSecrets(data.content);
-                onEvent({
-                  type: 'text',
-                  delta: lastPlannerResponse,
-                });
-              }
-            }
-          } else if (type !== 'USER_INPUT' && type !== 'CONVERSATION_HISTORY') {
-            // This is a tool execution result step
-            const rawTypeName = type.toLowerCase().replace(/_/g, '');
-            const matchIdx = pendingToolCalls.findIndex((t) => {
-              const mappedName = t.name.toLowerCase().replace(/_/g, '');
-              return (
-                mappedName === rawTypeName ||
-                (mappedName === 'listdir' && rawTypeName === 'listdirectory') ||
-                (mappedName === 'replacefilecontent' && rawTypeName === 'replacefilecontent') ||
-                (mappedName === 'multireplacefilecontent' && rawTypeName === 'multireplacefilecontent') ||
-                (mappedName === 'writetofile' && rawTypeName === 'writetofile')
-              );
-            });
-
-            if (matchIdx !== -1) {
-              const toolCall = pendingToolCalls[matchIdx];
-              pendingToolCalls.splice(matchIdx, 1);
-              onEvent({
-                type: 'tool_result',
-                id: toolCall.id,
-                output: data.content || '',
-                isError: data.status === 'ERROR',
-              });
-            }
-          }
-        } catch (err) {
-          break;
-        }
+      const stat = fs.statSync(transcriptPath);
+      if (stat.size < lastReadOffset) {
+        lastReadOffset = 0;
+        baselineBytes = 0;
       }
+      if (stat.size === lastReadOffset) {
+        return;
+      }
+      const fd = fs.openSync(transcriptPath, 'r');
+      try {
+        const buf = Buffer.alloc(stat.size - lastReadOffset);
+        fs.readSync(fd, buf, 0, buf.length, lastReadOffset);
+        chunk = buf.toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+      lastReadOffset = stat.size;
     } catch (err: any) {
       logger.error('agent.transcript_poll_error', err.message);
+      return;
+    }
+
+    const lines = chunk.split('\n');
+    const completeLines = lines.slice(0, -1);
+    let trailing = lines[lines.length - 1] || '';
+    if (trailing.length > 0) {
+      lastReadOffset -= Buffer.byteLength(trailing, 'utf8');
+    }
+
+    for (const line of completeLines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let data: any;
+      try {
+        data = JSON.parse(trimmed);
+      } catch (err) {
+        break;
+      }
+
+      const stepCreatedAt = data.created_at ? new Date(data.created_at).getTime() : 0;
+      if (stepCreatedAt && stepCreatedAt < startedAt - 5000) {
+        continue;
+      }
+
+      const stepIdx = Number(data.step_index);
+      if (!isNaN(stepIdx) && stepIdx <= initialMaxStepIndex) {
+        continue;
+      }
+
+      const type = String(data.type || '').toUpperCase();
+      if (!ALLOWED_STEP_TYPES.has(type)) {
+        continue;
+      }
+
+      if (type === 'PLANNER_RESPONSE') {
+        if (processedStepIndices.has(stepIdx)) continue;
+        processedStepIndices.add(stepIdx);
+
+        if (data.thinking) {
+          onEvent({
+            type: 'thinking',
+            delta: redactSecrets(data.thinking),
+          });
+        }
+
+        if (data.tool_calls && Array.isArray(data.tool_calls)) {
+          data.tool_calls.forEach((tc: any, tcIdx: number) => {
+            const toolId = `${stepIdx}-${tcIdx}`;
+            const dedupKey = `${id}:${toolId}:${tc.name}`;
+            if (seenToolCallKeys.has(dedupKey)) return;
+            seenToolCallKeys.add(dedupKey);
+            const mappedName = mapToolName(tc.name);
+            pendingToolCalls.push({ id: toolId, name: tc.name });
+            onEvent({
+              type: 'tool_use',
+              id: toolId,
+              name: mappedName,
+              input: tc.args,
+            });
+          });
+        }
+
+        if (data.content && (!data.tool_calls || data.tool_calls.length === 0)) {
+          lastPlannerResponse = redactSecrets(data.content);
+          onEvent({
+            type: 'text',
+            delta: lastPlannerResponse,
+          });
+        }
+      } else {
+        const rawTypeName = type.toLowerCase().replace(/_/g, '');
+        const matchIdx = pendingToolCalls.findIndex((t) => {
+          const mappedName = t.name.toLowerCase().replace(/_/g, '');
+          return (
+            mappedName === rawTypeName ||
+            (mappedName === 'listdir' && rawTypeName === 'listdirectory') ||
+            (mappedName === 'replacefilecontent' && rawTypeName === 'replacefilecontent') ||
+            (mappedName === 'multireplacefilecontent' && rawTypeName === 'multireplacefilecontent') ||
+            (mappedName === 'writetofile' && rawTypeName === 'writetofile')
+          );
+        });
+
+        if (matchIdx !== -1) {
+          const toolCall = pendingToolCalls[matchIdx];
+          pendingToolCalls.splice(matchIdx, 1);
+          const resultKey = `${id}:result:${toolCall.id}`;
+          if (seenToolCallKeys.has(resultKey)) continue;
+          seenToolCallKeys.add(resultKey);
+          onEvent({
+            type: 'tool_result',
+            id: toolCall.id,
+            output: data.content || '',
+            isError: data.status === 'ERROR',
+          });
+        }
+      }
     }
   }
 

@@ -338,6 +338,13 @@ export class LarkGateway {
     return /^(同意|可以|继续|好的|好|行|确认|确定|开始|执行|按这个|按上面|用中文|中文|好了没|好了吗|啥情况|什么意思)$/.test(normalized);
   }
 
+  private isPureChitChat(text: string): boolean {
+    const normalized = text.replace(/\s+/g, '').trim().toLowerCase();
+    if (!normalized) return false;
+    if (normalized.length > 12) return false;
+    return /^(hi|hello|hey|哈喽|哈啰|你好|您好|在吗|在不|在么|早|早上好|中午好|下午好|晚上好|嗨|喂|测试|test|ping)[。.!！~～]*$/.test(normalized);
+  }
+
   private looksLikeStatusProbe(text: string): boolean {
     const normalized = text.replace(/[\s，。！？!?～~…,.]+/g, '').trim();
     if (!normalized) return false;
@@ -360,11 +367,15 @@ export class LarkGateway {
   }
 
   private buildContextualAgentPrompt(userPrompt: string, scope: string, senderId: string, session: Session): string {
-    const recentContext = session.recentMessages.length > 0
+    const isChitChat = this.isPureChitChat(userPrompt);
+    const recentContext = !isChitChat && session.recentMessages.length > 0
       ? `<recent_messages>\n${session.recentMessages.slice(-8).join('\n')}\n</recent_messages>`
       : '';
     const shortReplyHint = this.isContextDependentReply(userPrompt)
       ? '用户当前消息很短，必须优先结合最近对话判断它是在选择、确认、追问、催办还是要求切换语言；不要把它当成孤立的新任务。'
+      : '';
+    const chitChatHint = isChitChat
+      ? '用户只是在打招呼或简单测试连通性。请用一两句话简短回应即可，不要主动检索代码、读取文件、运行命令或开启任何新任务。'
       : '';
     const conversationText = session.conversationId || 'none';
 
@@ -383,7 +394,10 @@ export class LarkGateway {
       'bridge_context 是桥接层元数据，只用于理解上下文；不要在回复中复述这些字段。',
       '这是连续飞书会话；如果底层 CLI 没有可用 conversationId，也必须根据 recent_messages 延续上下文。',
       '不要把孤立的数字、同意、继续、用中文、问号、好了没当成全新需求；它们通常是在回应上一轮选项或追问上一轮任务。',
+      'recent_messages 只是上下文参考，绝不可因为里面在讨论某个代码任务，就主动重新检索、读取文件、运行命令或重启那个任务。是否要执行工具，只看当前的 <user_message> 是不是明确要求执行。',
+      '当 <user_message> 内容很短或只是打招呼/确认/感叹（如 hi、你好、在吗、收到、好的、谢谢）时，只用一两句话简短回复，禁止主动调用任何工具。',
       shortReplyHint,
+      chitChatHint,
       '</bridge_instructions>',
       recentContext,
       '<user_message>',
@@ -464,16 +478,21 @@ export class LarkGateway {
     try {
       if (this.config.reply.mode === 'card') {
         const card = renderCard(state);
-        const res = await this.client.im.message.reply({
-          path: {
-            message_id: msgId,
-          },
-          data: {
-            content: JSON.stringify(card),
-            msg_type: 'interactive',
-          },
-        });
-        taskCardMessageId = res?.data?.message_id || '';
+        try {
+          const { cardId, messageId } = await this.createAndReplyCard(msgId, card);
+          taskCardMessageId = messageId;
+          (session as any).activeTaskCardId = cardId;
+          (session as any).activeTaskCardSequence = 1;
+        } catch (sendErr: any) {
+          logger.error('lark.reply_card_failed', JSON.stringify({
+            scope,
+            msgId,
+            status: sendErr?.response?.status,
+            body: sendErr?.response?.data,
+            cardPreview: JSON.stringify(card).slice(0, 500),
+          }));
+          throw sendErr;
+        }
       } else {
         const text = renderText(state);
         const res = await this.replyText(msgId, text || 'Thinking...');
@@ -779,15 +798,60 @@ export class LarkGateway {
     }
   }
 
+  private async createAndReplyCard(
+    replyToMsgId: string,
+    cardSpec: object,
+  ): Promise<{ cardId: string; messageId: string }> {
+    const createRes: any = await (this.client as any).cardkit.v1.card.create({
+      data: {
+        type: 'card_json',
+        data: JSON.stringify(cardSpec),
+      },
+    });
+    const cardId = createRes?.data?.card_id;
+    if (!cardId) {
+      throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(createRes)}`);
+    }
+    const sendRes: any = await this.client.im.message.reply({
+      path: { message_id: replyToMsgId },
+      data: {
+        msg_type: 'interactive',
+        content: JSON.stringify({ type: 'card', data: { card_id: cardId } }),
+      },
+    });
+    const messageId = sendRes?.data?.message_id || '';
+    return { cardId, messageId };
+  }
+
+  private async updateCardKit(cardId: string, cardSpec: object, sequence: number) {
+    await (this.client as any).cardkit.v1.card.update({
+      path: { card_id: cardId },
+      data: {
+        card: { type: 'card_json', data: JSON.stringify(cardSpec) },
+        sequence,
+        uuid: `u_${cardId}_${sequence}`,
+      },
+    });
+  }
+
   private async patchTaskProgress(cardMessageId: string, state: RunState, version: number, isFinal: boolean) {
     if (!isFinal && this.taskUpdateVersions.get(cardMessageId) !== version) return;
     try {
       if (this.config.reply.mode === 'card') {
-        const card = renderCard(state);
-        await this.client.im.v1.message.patch({
-          path: { message_id: cardMessageId },
-          data: { content: JSON.stringify(card) },
-        });
+        const session = state.scope ? sessionManager.getSession(state.scope) : undefined;
+        const cardId = session ? (session as any).activeTaskCardId : undefined;
+        if (cardId) {
+          const seq = ((session as any).activeTaskCardSequence || 1) + 1;
+          (session as any).activeTaskCardSequence = seq;
+          const card = renderCard(state);
+          await this.updateCardKit(cardId, card, seq);
+        } else {
+          const card = renderCard(state);
+          await this.client.im.v1.message.patch({
+            path: { message_id: cardMessageId },
+            data: { content: JSON.stringify(card) },
+          });
+        }
       } else if (state.terminal !== 'running') {
         const text = renderText(state);
         await this.replyText(cardMessageId, text);
@@ -900,17 +964,15 @@ export class LarkGateway {
           wide_screen_mode: true,
           enable_forward: true,
         },
-        body: {
-          elements: [
-            {
-              tag: 'div',
-              text: {
-                tag: 'lark_md',
-                content: formattedText,
-              },
+        elements: [
+          {
+            tag: 'div',
+            text: {
+              tag: 'lark_md',
+              content: formattedText,
             },
-          ],
-        },
+          },
+        ],
       };
       return await this.client.im.message.reply({
         path: {
@@ -1104,72 +1166,70 @@ export class LarkGateway {
         },
         template,
       },
-      body: {
-        elements: [
-          {
-            tag: 'div',
-            element_id: 'ws_info',
-            text: {
-              tag: 'lark_md',
-              content: `**工作区**: \`${req.workspace}\``,
-            },
+      elements: [
+        {
+          tag: 'div',
+          element_id: 'ws_info',
+          text: {
+            tag: 'lark_md',
+            content: `**工作区**: \`${req.workspace}\``,
           },
-          {
-            tag: 'div',
-            element_id: 'tool_info',
-            text: {
-              tag: 'lark_md',
-              content: `**工具名**: \`${req.toolName}\``,
-            },
+        },
+        {
+          tag: 'div',
+          element_id: 'tool_info',
+          text: {
+            tag: 'lark_md',
+            content: `**工具名**: \`${req.toolName}\``,
           },
-          {
-            tag: 'div',
-            element_id: 'risk_info',
-            text: {
-              tag: 'lark_md',
-              content: `**风险等级**: \`${req.riskLevel}\`\n**原因**: ${req.riskReason}`,
-            },
+        },
+        {
+          tag: 'div',
+          element_id: 'risk_info',
+          text: {
+            tag: 'lark_md',
+            content: `**风险等级**: \`${req.riskLevel}\`\n**原因**: ${req.riskReason}`,
           },
-          {
-            tag: 'div',
-            element_id: 'args_info',
-            text: {
-              tag: 'lark_md',
-              content: `**待执行命令/参数**:\n\`\`\`json\n${req.toolArgsPreview}\n\`\`\``,
-            },
+        },
+        {
+          tag: 'div',
+          element_id: 'args_info',
+          text: {
+            tag: 'lark_md',
+            content: `**待执行命令/参数**:\n\`\`\`json\n${req.toolArgsPreview}\n\`\`\``,
           },
-          {
-            tag: 'button',
-            element_id: 'btn_approve',
-            text: {
-              tag: 'plain_text',
-              content: '允许 (Approve)',
-            },
-            type: 'primary',
-            value: {
-              type: 'approval_decision',
-              action: 'approve',
-              approval_id: req.approvalId,
-              nonce: req.nonce,
-            },
+        },
+        {
+          tag: 'button',
+          element_id: 'btn_approve',
+          text: {
+            tag: 'plain_text',
+            content: '允许 (Approve)',
           },
-          {
-            tag: 'button',
-            element_id: 'btn_reject',
-            text: {
-              tag: 'plain_text',
-              content: '拒绝 (Deny)',
-            },
-            type: 'danger',
-            value: {
-              type: 'approval_decision',
-              action: 'reject',
-              approval_id: req.approvalId,
-              nonce: req.nonce,
-            },
+          type: 'primary',
+          value: {
+            type: 'approval_decision',
+            action: 'approve',
+            approval_id: req.approvalId,
+            nonce: req.nonce,
           },
-        ],
-      },
+        },
+        {
+          tag: 'button',
+          element_id: 'btn_reject',
+          text: {
+            tag: 'plain_text',
+            content: '拒绝 (Deny)',
+          },
+          type: 'danger',
+          value: {
+            type: 'approval_decision',
+            action: 'reject',
+            approval_id: req.approvalId,
+            nonce: req.nonce,
+          },
+        },
+      ],
     };
   }
 
@@ -1191,34 +1251,32 @@ export class LarkGateway {
         },
         template: 'grey',
       },
-      body: {
-        elements: [
-          {
-            tag: 'div',
-            element_id: 'ws_info',
-            text: {
-              tag: 'lark_md',
-              content: `**工作区**: \`${req.workspace}\``,
-            },
+      elements: [
+        {
+          tag: 'div',
+          element_id: 'ws_info',
+          text: {
+            tag: 'lark_md',
+            content: `**工作区**: \`${req.workspace}\``,
           },
-          {
-            tag: 'div',
-            element_id: 'tool_info',
-            text: {
-              tag: 'lark_md',
-              content: `**工具名**: \`${req.toolName}\``,
-            },
+        },
+        {
+          tag: 'div',
+          element_id: 'tool_info',
+          text: {
+            tag: 'lark_md',
+            content: `**工具名**: \`${req.toolName}\``,
           },
-          {
-            tag: 'div',
-            element_id: 'status_info',
-            text: {
-              tag: 'lark_md',
-              content: `**审批状态**: ${statusText}${req.decidedBy ? ` (由 ${req.decidedBy} 操作)` : ''}`,
-            },
+        },
+        {
+          tag: 'div',
+          element_id: 'status_info',
+          text: {
+            tag: 'lark_md',
+            content: `**审批状态**: ${statusText}${req.decidedBy ? ` (由 ${req.decidedBy} 操作)` : ''}`,
           },
-        ],
-      },
+        },
+      ],
     };
   }
 
@@ -1327,95 +1385,95 @@ export class LarkGateway {
       },
       body: {
         elements: [
-          {
-            tag: 'form',
-            name: 'switch_session_form',
-            elements: [
-              {
-                tag: 'div',
-                text: {
-                  tag: 'lark_md',
-                  content: '切到哪个工作区 / 会话？',
-                },
+        {
+          tag: 'form',
+          name: 'switch_session_form',
+          elements: [
+            {
+              tag: 'div',
+              text: {
+                tag: 'lark_md',
+                content: '切到哪个工作区 / 会话？',
               },
-              {
-                tag: 'div',
-                text: {
-                  tag: 'lark_md',
-                  content: '**工作区**',
-                },
+            },
+            {
+              tag: 'div',
+              text: {
+                tag: 'lark_md',
+                content: '**工作区**',
               },
-              {
-                tag: 'select_static',
-                name: 'workspace',
-                placeholder: {
-                  tag: 'plain_text',
-                  content: wsDisplay,
-                },
-                initial_option: session.workspace,
-                options: workspaceOptions.slice(0, 20),
+            },
+            {
+              tag: 'select_static',
+              name: 'workspace',
+              placeholder: {
+                tag: 'plain_text',
+                content: wsDisplay,
               },
-              {
-                tag: 'div',
-                text: {
-                  tag: 'lark_md',
-                  content: '**会话**',
-                },
+              initial_option: session.workspace,
+              options: workspaceOptions.slice(0, 20),
+            },
+            {
+              tag: 'div',
+              text: {
+                tag: 'lark_md',
+                content: '**会话**',
               },
-              {
-                tag: 'select_static',
-                name: 'session',
-                placeholder: {
-                  tag: 'plain_text',
-                  content: session.conversationId ? session.conversationId.slice(0, 8) : '新建会话',
-                },
-                initial_option: currentSessionValue,
-                options: sessionOptions.slice(0, 20),
+            },
+            {
+              tag: 'select_static',
+              name: 'session',
+              placeholder: {
+                tag: 'plain_text',
+                content: session.conversationId ? session.conversationId.slice(0, 8) : '新建会话',
               },
-              {
-                tag: 'hr',
-              },
-              {
-                tag: 'column_set',
-                flex_mode: 'flow',
-                horizontal_spacing: 'small',
-                columns: [
-                  {
-                    tag: 'column',
-                    width: 'auto',
-                    elements: [
-                      {
-                        tag: 'button',
-                        name: 'cancel_btn',
-                        text: {
-                          tag: 'plain_text',
-                          content: '取消',
-                        },
-                        behaviors: [{ type: 'callback', value: { type: 'switch_session_cancel', scope: session.scope } }],
+              initial_option: currentSessionValue,
+              options: sessionOptions.slice(0, 20),
+            },
+            {
+              tag: 'hr',
+            },
+            {
+              tag: 'column_set',
+              flex_mode: 'flow',
+              horizontal_spacing: 'small',
+              columns: [
+                {
+                  tag: 'column',
+                  width: 'auto',
+                  elements: [
+                    {
+                      tag: 'button',
+                      name: 'cancel_btn',
+                      text: {
+                        tag: 'plain_text',
+                        content: '取消',
                       },
-                    ],
-                  },
-                  {
-                    tag: 'column',
-                    width: 'auto',
-                    elements: [
-                      {
-                        tag: 'button',
-                        name: 'submit_btn',
-                        text: {
-                          tag: 'plain_text',
-                          content: '切换',
-                        },
-                        type: 'primary',
-                        form_action_type: 'submit',
-                        behaviors: [{ type: 'callback', value: { type: 'switch_session_confirm', scope: session.scope } }],
+                      behaviors: [{ type: 'callback', value: { type: 'switch_session_cancel', scope: session.scope } }],
+                    },
+                  ],
+                },
+                {
+                  tag: 'column',
+                  width: 'auto',
+                  elements: [
+                    {
+                      tag: 'button',
+                      name: 'submit_btn',
+                      text: {
+                        tag: 'plain_text',
+                        content: '切换',
                       },
-                    ],
-                  },
-                ],
-              },
-            ],
-          },
+                      type: 'primary',
+                      form_action_type: 'submit',
+                      behaviors: [{ type: 'callback', value: { type: 'switch_session_confirm', scope: session.scope } }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
         ],
       },
     };

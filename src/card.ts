@@ -423,15 +423,18 @@ function collapsedToolSummary(tools: ToolEntry[], finalized: boolean) {
 }
 
 function collapsiblePanel(opts: { title: string; expanded: boolean; border: string; body: string }) {
-  return {
+  const panel: any = {
     tag: 'collapsible_panel',
     expanded: opts.expanded,
     header: panelHeader(opts.title),
-    border: { color: opts.border, corner_radius: '5px' },
     vertical_spacing: '8px',
-    padding: '8px 8px 8px 8px',
     elements: [{ tag: 'markdown', content: opts.body, text_size: 'notation' }],
   };
+  if (opts.expanded) {
+    panel.border = { color: opts.border, corner_radius: '5px' };
+    panel.padding = '8px 8px 8px 8px';
+  }
+  return panel;
 }
 
 function panelHeader(titleMd: string) {
@@ -537,10 +540,9 @@ export function renderCard(state: RunState): object {
     elements.push(stopButton(state.scope));
   }
 
-  return {
+  const card: any = {
     schema: '2.0',
     config: {
-      streaming_mode: state.terminal === 'running',
       summary: { content: summaryText(state) },
     },
     header: {
@@ -552,6 +554,8 @@ export function renderCard(state: RunState): object {
     },
     body: { elements },
   };
+
+  return card;
 }
 
 export function renderText(state: RunState): string {
