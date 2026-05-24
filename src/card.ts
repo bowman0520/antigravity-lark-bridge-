@@ -144,6 +144,17 @@ export function markInterrupted(state: RunState): RunState {
   };
 }
 
+export function markIdleTimeout(state: RunState, minutes: number): RunState {
+  return {
+    ...state,
+    blocks: closeStreamingText(state.blocks),
+    reasoning: { ...state.reasoning, active: false },
+    terminal: 'idle_timeout',
+    footer: null,
+    idleTimeoutMinutes: minutes,
+  };
+}
+
 export function finalizeIfRunning(state: RunState): RunState {
   if (state.terminal !== 'running') return state;
   return {

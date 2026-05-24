@@ -22,6 +22,9 @@ export const MEDIA_DIR = path.join(APP_DIR, 'media');
 
 export const LAUNCHD_PLIST_FILE = path.join(os.homedir(), 'Library', 'LaunchAgents', 'com.antigravity-lark-bridge.plist');
 
+export const ANTIGRAVITY_IDE_STATE_DB = path.join(os.homedir(), 'Library', 'Application Support', 'Antigravity IDE', 'User', 'globalStorage', 'state.vscdb');
+export const ANTIGRAVITY_STATE_DB = path.join(os.homedir(), 'Library', 'Application Support', 'Antigravity', 'User', 'globalStorage', 'state.vscdb');
+
 export function getMediaChatDir(chatId: string): string {
   const safeChatId = chatId.replace(/[^a-zA-Z0-9._-]/g, '_');
   return path.join(MEDIA_DIR, safeChatId);

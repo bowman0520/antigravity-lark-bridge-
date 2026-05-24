@@ -7,14 +7,29 @@ import { sessionManager, Session } from './session';
 import { getApproval, updateApprovalStatus, ApprovalRequest } from './approval';
 import { pendingIpcRequests, sendJson, registerCardCallback } from './ipc';
 import { runAgent, AgentRunHandle } from './adapter';
-import { getAllowedWorkspaces, getBrainDir } from './workspace';
+import { getAllowedWorkspaces, getAntigravityProjects, getBrainDir } from './workspace';
 import { getMediaChatDir } from './paths';
 import { prepareImageForAgent, PreparedImage } from './media';
 import { limitAgentPrompt, truncateMiddle } from './payload';
 import { PromptQueue, QueuedPrompt } from './promptQueue';
-import { reduce, initialState, finalizeIfRunning, renderCard, renderText, toLarkMarkdown, RunState } from './card';
+import { reduce, initialState, finalizeIfRunning, markIdleTimeout, markInterrupted, renderCard, renderText, toLarkMarkdown, RunState } from './card';
 import { isAdmin, isChatAllowed, isUserAllowed } from './access';
 import { formatDoctorChecks, runDoctor } from './doctor';
+
+type InterruptReason = 'user_stop' | 'new_session' | 'shutdown' | 'idle_timeout' | 'stale_run';
+
+interface ActiveRun {
+  scope: string;
+  runHandle: AgentRunHandle;
+  cardMessageId: string;
+  state: RunState;
+  interrupted: boolean;
+  startedAt: number;
+  lastActivityAt: number;
+  idleTimer?: NodeJS.Timeout;
+}
+
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 export class LarkGateway {
   private client: Lark.Client;
@@ -27,6 +42,7 @@ export class LarkGateway {
   private agentUnavailableMessage = '';
   private taskUpdateVersions = new Map<string, number>();
   private finalizedTaskCards = new Set<string>();
+  private activeRuns = new Map<string, ActiveRun>();
 
   constructor(config: ResolvedConfig) {
     this.config = config;
@@ -61,7 +77,7 @@ export class LarkGateway {
   }
 
   public async stop() {
-    // There is no explicit stop, but we can log
+    await this.interruptAllActiveRuns('shutdown');
     logger.info('lark.ws_disconnected');
   }
 
@@ -195,6 +211,11 @@ export class LarkGateway {
       return;
     }
 
+    if (this.looksLikeStatusProbe(text)) {
+      await this.replyText(msgId, this.buildRuntimeStatusText(scope, session));
+      return;
+    }
+
     // Normal natural language Prompt
     await this.enqueuePrompt(text, scope, msgId, senderId);
   }
@@ -228,16 +249,9 @@ export class LarkGateway {
         `会话 ID: \`${session.conversationId || 'none'}\``;
       await this.replyText(msgId, statusText);
     } else if (primary === '/new' || primary === '/reset') {
-      if (session.status === 'RUNNING' || session.status === 'AWAITING_APPROVAL') {
-        const activeHandle = (session as any).activeRunHandle;
-        if (activeHandle && typeof activeHandle.stop === 'function') {
-          await activeHandle.stop();
-        }
-        this.cancelPendingApprovals(scope, 'Task reset by user command.');
-        this.promptQueue.clear(scope);
-      }
+      const wasRunning = await this.interruptRun(scope, 'new_session');
       sessionManager.resetSession(scope, this.config.agent.defaultWorkspace);
-      await this.replyText(msgId, '已清空当前会话上下文，下一条消息会开启新的 Antigravity 会话。');
+      await this.replyText(msgId, wasRunning ? '已中断当前任务并清空会话上下文，下一条消息会开启新的 Antigravity 会话。' : '已清空当前会话上下文，下一条消息会开启新的 Antigravity 会话。');
     } else if (primary === '/doctor') {
       if (!isAdmin(this.config, senderId)) {
         await this.replyText(msgId, '无权限执行 /doctor。');
@@ -245,23 +259,8 @@ export class LarkGateway {
       }
       await this.replyText(msgId, formatDoctorChecks(runDoctor()));
     } else if (primary === '/stop') {
-      if (session.status === 'RUNNING' || session.status === 'AWAITING_APPROVAL') {
-        // Cancel active run
-        const activeHandle = (session as any).activeRunHandle;
-        if (activeHandle && typeof activeHandle.stop === 'function') {
-          await activeHandle.stop();
-        }
-
-        this.cancelPendingApprovals(scope, 'Task cancelled by user /stop command.');
-        this.promptQueue.clear(scope);
-        session.pendingQueue = [];
-
-        sessionManager.setStatus(scope, 'CANCELLED');
-        await this.replyText(msgId, '🚫 当前任务已被用户中断停止。');
-        sessionManager.setStatus(scope, 'IDLE');
-      } else {
-        await this.replyText(msgId, '⚠️ 当前没有正在运行的任务。');
-      }
+      const stopped = await this.interruptRun(scope, 'user_stop');
+      await this.replyText(msgId, stopped ? '🚫 当前任务已被用户中断停止。' : '⚠️ 当前没有正在运行的任务。');
     } else if (primary === '/reconnect') {
       if (!isAdmin(this.config, senderId)) {
         await this.replyText(msgId, '无权限执行 /reconnect。');
@@ -270,15 +269,25 @@ export class LarkGateway {
       await this.replyText(msgId, '🔄 WebSocket 连接在线，已刷新。');
     } else if (primary === '/list' || primary === '/ws') {
       const card = this.buildListCard(session);
-      await this.client.im.message.reply({
-        path: {
-          message_id: msgId,
-        },
-        data: {
-          content: JSON.stringify(card),
-          msg_type: 'interactive',
-        },
-      });
+      try {
+        const res = await this.client.im.message.reply({
+          path: {
+            message_id: msgId,
+          },
+          data: {
+            content: JSON.stringify(card),
+            msg_type: 'interactive',
+          },
+        });
+        logger.info('lark.list_card_sent', { scope, messageId: res?.data?.message_id });
+      } catch (err: any) {
+        logger.error('lark.list_card_error', err.message, {
+          code: err?.response?.data?.code,
+          msg: err?.response?.data?.msg,
+          logId: err?.response?.data?.log_id,
+        });
+        await this.replyText(msgId, this.buildWorkspaceSessionText(session));
+      }
     } else {
       await this.replyText(msgId, `❌ 未知指令: ${primary}。输入 /help 查看支持的命令。`);
     }
@@ -327,6 +336,27 @@ export class LarkGateway {
     if (/^[0-9一二三四五六七八九十]{1,3}$/.test(normalized)) return true;
     if (/^[？?。.！!…]{1,8}$/.test(normalized)) return true;
     return /^(同意|可以|继续|好的|好|行|确认|确定|开始|执行|按这个|按上面|用中文|中文|好了没|好了吗|啥情况|什么意思)$/.test(normalized);
+  }
+
+  private looksLikeStatusProbe(text: string): boolean {
+    const normalized = text.replace(/[\s，。！？!?～~…,.]+/g, '').trim();
+    if (!normalized) return false;
+    if (/^(\?|？)+$/.test(normalized)) return true;
+    if (/^(还是)?(不行|没反应|没有反应|卡住了|卡了吗|还在吗|咋没反应|怎么没反应|啥情况|什么情况|无响应|停住了|还没好吗|好了没|好了吗)[啊哦呀呢吗嘛吧]*$/.test(normalized)) return true;
+    if (normalized.length <= 16 && /(没反应|没有反应|卡住|无响应|不行|啥情况|什么情况)/.test(normalized)) return true;
+    return false;
+  }
+
+  private buildRuntimeStatusText(scope: string, session: Session): string {
+    const activeRun = this.activeRuns.get(scope);
+    if (!activeRun) {
+      return `📊 Antigravity Bridge 状态\n\n当前没有正在运行的任务。\n工作区: \`${session.workspace}\`\n会话 ID: \`${session.conversationId || 'none'}\`\n\n如果要开始新上下文，可以发送 /new；如果要诊断连接，可以发送 /status 或 /doctor。`;
+    }
+
+    const elapsed = this.formatDuration(Math.max(0, Math.round((Date.now() - activeRun.startedAt) / 1000)));
+    const idle = this.formatDuration(Math.max(0, Math.round((Date.now() - activeRun.lastActivityAt) / 1000)));
+    const pidText = activeRun.runHandle.pid ? `PID ${activeRun.runHandle.pid}` : 'PID 未知';
+    return `📊 Antigravity Bridge 状态\n\n当前任务仍在运行。\n已运行: ${elapsed}\n最近进展: ${idle} 前\n进程: ${pidText}\n工作区: \`${session.workspace}\`\n\n可发送 /stop 终止当前任务，或发送 /new 中断并开启新会话。`;
   }
 
   private buildContextualAgentPrompt(userPrompt: string, scope: string, senderId: string, session: Session): string {
@@ -462,11 +492,13 @@ export class LarkGateway {
         timeoutMs,
       }, this.config, async (evt) => {
         state = reduce(state, evt);
+        this.updateActiveRunState(scope, state);
         (session as any).activeTaskState = state;
         await this.updateTaskProgress(taskCardMessageId, state);
       });
 
       (session as any).activeRunHandle = runHandle;
+      this.registerActiveRun(scope, runHandle, taskCardMessageId, state);
 
       // Wait for run completion (or error)
       const finalResult = await runHandle.promise;
@@ -490,28 +522,35 @@ export class LarkGateway {
       state = finalizeIfRunning(state);
       await this.updateTaskProgress(taskCardMessageId, state);
     } catch (err: any) {
-      sessionManager.setStatus(scope, 'FAILED');
-      logger.error('agent.failed', err.message);
-      
-      const errorMsg = `出错了：${err.message}`;
-      if (this.isQuotaError(err.message)) {
-        this.rememberAgentUnavailable(err.message);
-      }
+      const activeRun = this.activeRuns.get(scope);
+      if (activeRun?.interrupted) {
+        state = activeRun.state;
+        logger.info('agent.interrupted', { scope });
+      } else {
+        sessionManager.setStatus(scope, 'FAILED');
+        logger.error('agent.failed', err.message);
 
-      if (this.isFatalCliError(err.message)) {
-        state.blocks = [];
-        state.reasoning = { content: '', active: false };
-      }
-      state.terminal = 'error';
-      state.errorMsg = errorMsg;
-      state.footer = null;
-      state = finalizeIfRunning(state);
-      await this.updateTaskProgress(taskCardMessageId, state);
+        const errorMsg = `出错了：${err.message}`;
+        if (this.isQuotaError(err.message)) {
+          this.rememberAgentUnavailable(err.message);
+        }
 
-      if (this.isQuotaError(err.message)) {
-        await this.replyText(msgId, errorMsg);
+        if (this.isFatalCliError(err.message)) {
+          state.blocks = [];
+          state.reasoning = { content: '', active: false };
+        }
+        state.terminal = 'error';
+        state.errorMsg = errorMsg;
+        state.footer = null;
+        state = finalizeIfRunning(state);
+        await this.updateTaskProgress(taskCardMessageId, state);
+
+        if (this.isQuotaError(err.message)) {
+          await this.replyText(msgId, errorMsg);
+        }
       }
     } finally {
+      this.clearActiveRun(scope);
       const currentSession = sessionManager.getSession(scope);
       if (currentSession && (currentSession.status === 'RUNNING' || currentSession.status === 'AWAITING_APPROVAL')) {
         sessionManager.setStatus(scope, 'IDLE');
@@ -520,6 +559,81 @@ export class LarkGateway {
       delete (session as any).activeTaskCardMessageId;
       delete (session as any).activeTaskState;
     }
+  }
+
+  private registerActiveRun(scope: string, runHandle: AgentRunHandle, cardMessageId: string, state: RunState) {
+    this.clearActiveRun(scope);
+    const activeRun: ActiveRun = {
+      scope,
+      runHandle,
+      cardMessageId,
+      state,
+      interrupted: false,
+      startedAt: runHandle.startedAt,
+      lastActivityAt: Date.now(),
+    };
+    this.activeRuns.set(scope, activeRun);
+    this.armIdleTimer(activeRun);
+  }
+
+  private updateActiveRunState(scope: string, state: RunState) {
+    const activeRun = this.activeRuns.get(scope);
+    if (!activeRun || activeRun.interrupted) return;
+    activeRun.state = state;
+    activeRun.lastActivityAt = Date.now();
+    this.armIdleTimer(activeRun);
+  }
+
+  private clearActiveRun(scope: string) {
+    const activeRun = this.activeRuns.get(scope);
+    if (activeRun?.idleTimer) clearTimeout(activeRun.idleTimer);
+    this.activeRuns.delete(scope);
+  }
+
+  private armIdleTimer(activeRun: ActiveRun) {
+    if (activeRun.idleTimer) clearTimeout(activeRun.idleTimer);
+    activeRun.idleTimer = setTimeout(() => {
+      void this.interruptRun(activeRun.scope, 'idle_timeout');
+    }, IDLE_TIMEOUT_MS);
+  }
+
+  private async interruptRun(scope: string, reason: InterruptReason): Promise<boolean> {
+    const session = sessionManager.getSession(scope);
+    const activeRun = this.activeRuns.get(scope);
+    const activeHandle = activeRun?.runHandle || ((session as any)?.activeRunHandle as AgentRunHandle | undefined);
+    if (!activeRun && !activeHandle && session?.status !== 'RUNNING' && session?.status !== 'AWAITING_APPROVAL') {
+      return false;
+    }
+
+    this.promptQueue.clear(scope);
+    if (session) session.pendingQueue = [];
+    this.cancelPendingApprovals(scope, `Task interrupted: ${reason}.`);
+
+    let state = activeRun?.state || ((session as any)?.activeTaskState as RunState | undefined) || { ...initialState, scope };
+    state = reason === 'idle_timeout' ? markIdleTimeout(state, Math.ceil(IDLE_TIMEOUT_MS / 60000)) : markInterrupted(state);
+    if (activeRun) {
+      activeRun.interrupted = true;
+      activeRun.state = state;
+    }
+    if (session) (session as any).activeTaskState = state;
+
+    const cardMessageId = activeRun?.cardMessageId || ((session as any)?.activeTaskCardMessageId as string | undefined) || '';
+    await this.updateTaskProgress(cardMessageId, state);
+
+    if (activeHandle?.isRunning?.()) {
+      await activeHandle.stop();
+    }
+
+    sessionManager.setStatus(scope, reason === 'idle_timeout' ? 'FAILED' : 'CANCELLED');
+    if (reason !== 'shutdown') {
+      sessionManager.setStatus(scope, 'IDLE');
+    }
+    return true;
+  }
+
+  public async interruptAllActiveRuns(reason: InterruptReason = 'shutdown') {
+    const scopes = new Set<string>(this.activeRuns.keys());
+    await Promise.allSettled([...scopes].map((scope) => this.interruptRun(scope, reason)));
   }
 
   private isQuotaError(message: string): boolean {
@@ -619,10 +733,7 @@ export class LarkGateway {
       ageMs: activeHandle?.startedAt ? now - activeHandle.startedAt : null,
     });
 
-    if (activeHandle && typeof activeHandle.stop === 'function' && activeHandle.isRunning()) {
-      void activeHandle.stop();
-    }
-    this.cancelPendingApprovals(scope, 'Task state was stale and has been reset.');
+    void this.interruptRun(scope, 'stale_run');
     delete (session as any).activeRunHandle;
     sessionManager.setStatus(scope, 'IDLE');
     return true;
@@ -860,112 +971,28 @@ export class LarkGateway {
 
   private async handleCardAction(data: any): Promise<any> {
     const operator = data.operator;
-    const actionVal = data.action?.value;
+    const actionVal = data.action?.value || data.action?.behaviors?.[0]?.value;
 
     if (!operator || !actionVal) {
       return {};
     }
 
-    if (actionVal.type === 'switch_session_confirm') {
+    if (actionVal.type === 'switch_session_confirm' || actionVal.type === 'switch_workspace' || actionVal.type === 'switch_conversation') {
       const scope = actionVal.scope;
-      const formValues = actionVal.form_values || {};
-      const selectedWorkspace = formValues.workspace;
-      const selectedSession = formValues.session;
+      const formValues = data.action?.form_value || data.action?.form_values || data.form_values || actionVal.form_values || {};
+      const selectedWorkspace = actionVal.workspace || formValues.workspace;
+      const selectedSession = actionVal.session || formValues.session;
+      logger.info('lark.switch_action', { type: actionVal.type, scope, selectedWorkspace, selectedSession, formValues, actionKeys: Object.keys(data.action || {}), dataKeys: Object.keys(data) });
 
-      const session = sessionManager.getSession(scope);
-      if (!session) {
-        return {
-          toast: { type: 'error', content: '会话不存在' }
-        };
-      }
-
-      if (selectedWorkspace && sessionManager.isWorkspaceLocked(selectedWorkspace, scope)) {
-        return {
-          toast: { type: 'error', content: '工作区已被其他运行中的会话锁定，请稍后再试' }
-        };
-      }
-
-      if (selectedWorkspace) {
-        session.workspace = selectedWorkspace;
-      }
-
-      if (selectedSession) {
-        if (selectedSession === 'new') {
-          session.conversationId = null;
-        } else {
-          session.conversationId = selectedSession;
-        }
-      }
-
-      sessionManager.saveSessions();
-
-      const updatedCard = {
-        schema: '2.0',
-        header: {
-          title: {
-            tag: 'plain_text',
-            content: '切换工作区与会话 - 已完成',
-          },
-          template: 'green',
-        },
-        body: {
-          elements: [
-            {
-              tag: 'div',
-              text: {
-                tag: 'lark_md',
-                content: `🟢 **工作区与会话切换成功！**\n\n` +
-                  `**当前工作区**: \`${session.workspace}\`\n` +
-                  `**当前会话 ID**: \`${session.conversationId || '新建会话 (无)'}\``,
-              },
-            },
-          ],
-        },
-      };
-
-      return {
-        toast: {
-          type: 'success',
-          content: '切换成功',
-        },
-        card: updatedCard,
-      };
+      return this.applyWorkspaceSessionSwitch(scope, selectedWorkspace, selectedSession);
     }
 
     if (actionVal.type === 'switch_session_cancel') {
-      const scope = actionVal.scope;
-      const session = sessionManager.getSession(scope);
-
-      const updatedCard = {
-        schema: '2.0',
-        header: {
-          title: {
-            tag: 'plain_text',
-            content: '切换工作区与会话 - 已取消',
-          },
-          template: 'grey',
-        },
-        body: {
-          elements: [
-            {
-              tag: 'div',
-              text: {
-                tag: 'lark_md',
-                content: `⚪ **操作已取消。**\n\n` +
-                  `**工作区保持为**: \`${session ? session.workspace : '未知'}\`\n` +
-                  `**会话保持为**: \`${(session && session.conversationId) || '新建会话 (无)'}\``,
-              },
-            },
-          ],
-        },
-      };
-
       return {
         toast: {
           type: 'info',
           content: '操作已取消',
         },
-        card: updatedCard,
       };
     }
 
@@ -974,25 +1001,15 @@ export class LarkGateway {
       if (!scope) {
         return { toast: { type: 'error', content: '无法确定任务作用域' } };
       }
-      const session = sessionManager.getSession(scope);
-      if (session && (session.status === 'RUNNING' || session.status === 'AWAITING_APPROVAL')) {
-        const activeHandle = (session as any).activeRunHandle;
-        if (activeHandle && typeof activeHandle.stop === 'function') {
-          await activeHandle.stop();
-        }
-        this.cancelPendingApprovals(scope, 'Task cancelled by user /stop command via button.');
-        this.promptQueue.clear(scope);
-        session.pendingQueue = [];
-        sessionManager.setStatus(scope, 'CANCELLED');
-        setTimeout(() => sessionManager.setStatus(scope, 'IDLE'), 1000);
+      const stopped = await this.interruptRun(scope, 'user_stop');
+      if (stopped) {
         return {
           toast: { type: 'success', content: '任务已终止' },
         };
-      } else {
-        return {
-          toast: { type: 'warning', content: '当前没有正在运行的任务' },
-        };
       }
+      return {
+        toast: { type: 'warning', content: '当前没有正在运行的任务' },
+      };
     }
 
     if (actionVal.type !== 'approval_decision') {
@@ -1205,8 +1222,46 @@ export class LarkGateway {
     };
   }
 
+  private buildWorkspaceSessionText(session: Session): string {
+    const workspaces = [...getAllowedWorkspaces(), ...getAntigravityProjects()].filter((v, i, a) => a.indexOf(v) === i).slice(0, 5).map((ws, index) => `${index + 1}. ${ws}`).join('\n') || '无可用工作区';
+    const conversations = this.getRecentConversations().slice(0, 5).map((item, index) => `${index + 1}. ${item.summary} (${item.id.slice(0, 8)})`).join('\n') || '暂无历史会话';
+    return `当前工作区: ${session.workspace}\n当前会话: ${session.conversationId || '新建会话'}\n\n可用工作区:\n${workspaces}\n\n最近会话:\n${conversations}`;
+  }
+
+  private applyWorkspaceSessionSwitch(scope: string, selectedWorkspace?: string, selectedSession?: string) {
+    const session = sessionManager.getSession(scope);
+    if (!session) {
+      return {
+        toast: { type: 'error', content: '会话不存在' },
+      };
+    }
+
+    if (selectedWorkspace && sessionManager.isWorkspaceLocked(selectedWorkspace, scope)) {
+      return {
+        toast: { type: 'error', content: '工作区已被其他运行中的会话锁定，请稍后再试' },
+      };
+    }
+
+    if (selectedWorkspace) {
+      session.workspace = selectedWorkspace;
+    }
+
+    if (selectedSession) {
+      session.conversationId = selectedSession === 'new' ? null : selectedSession;
+    }
+
+    sessionManager.saveSessions();
+
+    return {
+      toast: {
+        type: 'success',
+        content: `切换成功：${path.basename(session.workspace)} / ${session.conversationId ? session.conversationId.slice(0, 8) : '新建会话'}`,
+      },
+    };
+  }
+
   private buildListCard(session: Session) {
-    const allowed = getAllowedWorkspaces();
+    const allowed = Array.from(new Set([session.workspace, this.config.agent.defaultWorkspace, ...getAllowedWorkspaces(), ...getAntigravityProjects()].filter(Boolean)));
     const workspaceOptions = allowed.map(ws => {
       const basename = path.basename(ws);
       return {
@@ -1256,6 +1311,7 @@ export class LarkGateway {
 
     const wsBasename = path.basename(session.workspace);
     const wsDisplay = wsBasename === '' || wsBasename === '/' ? session.workspace : wsBasename;
+    const currentSessionValue = session.conversationId || 'new';
 
     return {
       schema: '2.0',
@@ -1273,7 +1329,7 @@ export class LarkGateway {
         elements: [
           {
             tag: 'form',
-            element_id: 'switch_session_form',
+            name: 'switch_session_form',
             elements: [
               {
                 tag: 'div',
@@ -1294,9 +1350,10 @@ export class LarkGateway {
                 name: 'workspace',
                 placeholder: {
                   tag: 'plain_text',
-                  content: `当前: ${wsDisplay}`,
+                  content: wsDisplay,
                 },
-                options: workspaceOptions,
+                initial_option: session.workspace,
+                options: workspaceOptions.slice(0, 20),
               },
               {
                 tag: 'div',
@@ -1310,37 +1367,50 @@ export class LarkGateway {
                 name: 'session',
                 placeholder: {
                   tag: 'plain_text',
-                  content: session.conversationId ? `当前: ${session.conversationId.slice(0, 8)}` : '当前: 新建会话',
+                  content: session.conversationId ? session.conversationId.slice(0, 8) : '新建会话',
                 },
-                options: sessionOptions,
+                initial_option: currentSessionValue,
+                options: sessionOptions.slice(0, 20),
               },
               {
-                tag: 'action',
-                layout: 'flow',
-                actions: [
+                tag: 'hr',
+              },
+              {
+                tag: 'column_set',
+                flex_mode: 'flow',
+                horizontal_spacing: 'small',
+                columns: [
                   {
-                    tag: 'button',
-                    text: {
-                      tag: 'plain_text',
-                      content: '取消',
-                    },
-                    type: 'default',
-                    value: {
-                      type: 'switch_session_cancel',
-                      scope: session.scope,
-                    },
+                    tag: 'column',
+                    width: 'auto',
+                    elements: [
+                      {
+                        tag: 'button',
+                        name: 'cancel_btn',
+                        text: {
+                          tag: 'plain_text',
+                          content: '取消',
+                        },
+                        behaviors: [{ type: 'callback', value: { type: 'switch_session_cancel', scope: session.scope } }],
+                      },
+                    ],
                   },
                   {
-                    tag: 'button',
-                    text: {
-                      tag: 'plain_text',
-                      content: '切换',
-                    },
-                    type: 'primary',
-                    value: {
-                      type: 'switch_session_confirm',
-                      scope: session.scope,
-                    },
+                    tag: 'column',
+                    width: 'auto',
+                    elements: [
+                      {
+                        tag: 'button',
+                        name: 'submit_btn',
+                        text: {
+                          tag: 'plain_text',
+                          content: '切换',
+                        },
+                        type: 'primary',
+                        form_action_type: 'submit',
+                        behaviors: [{ type: 'callback', value: { type: 'switch_session_confirm', scope: session.scope } }],
+                      },
+                    ],
                   },
                 ],
               },
@@ -1349,6 +1419,26 @@ export class LarkGateway {
         ],
       },
     };
+  }
+
+  private summarizeConversationInput(content: string): string {
+    const userMessageMatch = content.match(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/i);
+    const userRequestMatch = content.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i);
+    const raw = userMessageMatch?.[1] || userRequestMatch?.[1] || content;
+    const cleaned = raw
+      .replace(/<bridge_context>[\s\S]*?<\/bridge_context>/gi, '')
+      .replace(/<bridge_instructions>[\s\S]*?<\/bridge_instructions>/gi, '')
+      .replace(/<recent_messages>[\s\S]*?<\/recent_messages>/gi, '')
+      .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '')
+      .replace(/<ADDITIONAL_METADATA>[\s\S]*/gi, '')
+      .replace(/用户发送了一条包含图片的富文本消息。请直接查看并理解这些本地图片，然后回答用户。/g, '')
+      .replace(/用户附带文字：/g, '')
+      .replace(/图片路径：[\s\S]*/g, '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return cleaned;
   }
 
   private getRecentConversations(): Array<{ id: string; summary: string }> {
@@ -1372,13 +1462,8 @@ export class LarkGateway {
               if (!line.trim()) continue;
               const parsed = JSON.parse(line);
               if (parsed.type === 'USER_INPUT' && parsed.content) {
-                summary = parsed.content
-                  .replace(/<USER_REQUEST>|<\/USER_REQUEST>/g, '')
-                  .replace(/用户发送了一条包含图片的富文本消息。请直接查看并理解这些本地图片，然后回答用户。/g, '')
-                  .replace(/用户附带文字：/g, '')
-                  .replace(/图片路径：[\s\S]*/g, '')
-                  .trim();
-                break;
+                summary = this.summarizeConversationInput(parsed.content);
+                if (summary) break;
               }
             }
           } catch (e) {
