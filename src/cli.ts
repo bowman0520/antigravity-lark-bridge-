@@ -12,7 +12,7 @@ import { CONFIG_FILE } from './paths';
 import { runSetupWizard } from './wizard';
 import { formatDoctorChecks, runDoctor } from './doctor';
 import { findConflicts, killProcess, listProcesses, registerProcess, unregisterProcess } from './processRegistry';
-import { getServiceStatus, registerService, startService, stopService, unregisterService } from './daemon/serviceAdapter';
+import { getServiceStatus, registerService, restartService, startService, stopService, unregisterService } from './daemon/serviceAdapter';
 import {
   buildPayloadTooLargeDecision,
   byteLength,
@@ -51,9 +51,7 @@ program
   .description('Restart the user-level bridge service')
   .option('-c, --config <path>', 'path to configuration file')
   .action((options) => {
-    registerService({ configPath: options.config || CONFIG_FILE });
-    stopService();
-    startService();
+    restartService({ configPath: options.config || CONFIG_FILE });
     console.log('Bridge service restart requested.');
   });
 

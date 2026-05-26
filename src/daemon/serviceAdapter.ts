@@ -42,6 +42,30 @@ export function stopService() {
   else if (process.platform === 'win32') run('schtasks', ['/End', '/TN', SERVICE_LABEL], true);
 }
 
+export function restartService(options: ServiceOptions = {}) {
+  if (process.platform === 'darwin') {
+    const isLoaded = getServiceStatus().running;
+    if (isLoaded) {
+      stopService();
+      const start = Date.now();
+      while (Date.now() - start < 2000) {
+        if (!getServiceStatus().running) {
+          break;
+        }
+        spawnSync('sleep', ['0.1']);
+      }
+    }
+    registerService(options);
+    startService();
+  } else if (process.platform === 'linux') {
+    run('systemctl', ['--user', 'restart', SERVICE_LABEL], true);
+  } else if (process.platform === 'win32') {
+    stopService();
+    registerService(options);
+    startService();
+  }
+}
+
 export function unregisterService() {
   stopService();
   if (process.platform === 'linux') {

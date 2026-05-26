@@ -53,6 +53,8 @@ export class LarkGateway {
   private taskUpdateVersions = new Map<string, number>();
   private finalizedTaskCards = new Set<string>();
   private activeRuns = new Map<string, ActiveRun>();
+  private botOpenId?: string;
+  private botName?: string;
 
   constructor(config: ResolvedConfig) {
     this.config = config;
@@ -86,6 +88,19 @@ export class LarkGateway {
 
   public async start() {
     logger.info('lark.ws_connecting', { appId: this.config.lark.appId });
+    try {
+      const res = await this.client.request({
+        url: '/open-apis/bot/v3/info',
+        method: 'GET',
+      });
+      if (res && res.bot) {
+        this.botOpenId = res.bot.open_id;
+        this.botName = res.bot.app_name;
+        logger.info('lark.bot_info_loaded', { name: this.botName, openId: this.botOpenId });
+      }
+    } catch (err: any) {
+      logger.warn('lark.bot_info_failed', { error: err.message });
+    }
     await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
     logger.info('lark.ws_connected', { appId: this.config.lark.appId });
   }
@@ -193,7 +208,14 @@ export class LarkGateway {
 
     // If group, check mention
     if (message.chat_type === 'group') {
-      const isMentioned = message.mentions && message.mentions.some((m: any) => m.id === this.config.lark.appId || m.name === '机器人');
+      const isMentioned = message.mentions && message.mentions.some((m: any) => {
+        const mentionId = typeof m.id === 'object' ? (m.id?.open_id || m.id?.user_id) : m.id;
+        const mentionName = m.name;
+        return mentionId === this.config.lark.appId ||
+               (this.botOpenId && mentionId === this.botOpenId) ||
+               mentionName === '机器人' ||
+               (this.botName && mentionName === this.botName);
+      });
       if (this.config.reply.requireMentionInGroup && !isMentioned) {
         return;
       }
@@ -553,9 +575,9 @@ export class LarkGateway {
       sessionManager.appendExchange(scope, rawPrompt, finalResult);
       logger.info('agent.completed', { scope });
 
-      // Ensure final result is in state blocks
-      const hasFinalText = state.blocks.some(b => b.kind === 'text' && b.content.includes(finalResult));
-      if (!hasFinalText) {
+      // Use finalResult as fallback only when transcript polling yielded no text
+      const hasAnyText = state.blocks.some(b => b.kind === 'text' && b.content.trim().length > 0);
+      if (!hasAnyText && finalResult) {
         state = reduce(state, { type: 'text', delta: finalResult });
       }
 
