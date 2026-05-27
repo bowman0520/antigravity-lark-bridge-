@@ -40,6 +40,11 @@ interface PendingPrompt {
   enqueuedAt: number;
 }
 
+interface ChatModeCacheEntry {
+  mode: string;
+  expiresAt: number;
+}
+
 export class LarkGateway {
   private client: Lark.Client;
   private wsClient: Lark.WSClient;
@@ -53,6 +58,7 @@ export class LarkGateway {
   private taskUpdateVersions = new Map<string, number>();
   private finalizedTaskCards = new Set<string>();
   private activeRuns = new Map<string, ActiveRun>();
+  private chatModeCache = new Map<string, ChatModeCacheEntry>();
   private botOpenId?: string;
   private botName?: string;
 
@@ -201,10 +207,20 @@ export class LarkGateway {
       return;
     }
 
-    // Identify chat scope
-    const scope = message.thread_id
-      ? `topic:${chatId}:${message.thread_id}`
-      : (message.chat_type === 'p2p' ? `p2p:${chatId}` : `chat:${chatId}`);
+    const chatMode = await this.getChatMode(chatId, message.chat_type);
+    const threadKey = this.isTopicChatMode(chatMode)
+      ? (message.thread_id || message.root_id || message.parent_id)
+      : '';
+    const scope = message.chat_type === 'p2p'
+      ? `p2p:${chatId}`
+      : (threadKey ? `thread:${chatId}:${threadKey}` : `chat:${chatId}`);
+    logger.info('message.scope_resolved', {
+      scope,
+      chatMode,
+      hasThreadId: !!message.thread_id,
+      hasRootId: !!message.root_id,
+      hasParentId: !!message.parent_id,
+    });
 
     // If group, check mention
     if (message.chat_type === 'group') {
@@ -221,10 +237,22 @@ export class LarkGateway {
       }
     }
 
-    const session = sessionManager.getOrCreateSession(scope, this.config.agent.defaultWorkspace);
+    const session = this.getOrCreateMessageSession(scope, chatId, message.chat_type);
 
-    // Clean text by stripping mentions
-    text = text.replace(/<at id="[^"]+">@.*?<\/at>\s*/g, '').trim();
+    // Clean the current message by stripping mentions, then attach quoted/replied
+    // message content if Feishu only sent us a parent/root message id.
+    text = this.stripMentions(text);
+    const quotedMessageId = this.getQuotedMessageId(message);
+    const quotedContext = quotedMessageId ? await this.fetchQuotedMessageContext(message) : '';
+    if (quotedContext) {
+      text = text
+        ? `${quotedContext}\n\n<current_message>\n${text}\n</current_message>`
+        : `${quotedContext}\n\n<current_message>\n(no extra text)\n</current_message>`;
+    } else if (quotedMessageId && this.isQuoteDependentReply(text)) {
+      logger.warn('message.quote_context_required_but_missing', { quotedMessageId, text: text.substring(0, 80) });
+      await this.replyText(msgId, '我没有拿到被引用消息的正文，所以不能可靠判断这句“怎么看”指的是什么。请复制引用内容正文，或重新引用一条普通文本消息。');
+      return;
+    }
     if (!text) return;
 
     const imagePathMatches = Array.from(text.matchAll(/(\/[^\s)]+?\.(?:png|jpe?g|webp))/gi)).map((match) => match[1]);
@@ -340,6 +368,257 @@ export class LarkGateway {
     return parts.join(' ').trim();
   }
 
+  private stripMentions(text: string): string {
+    return text
+      .replace(/<at id="[^"]+">@.*?<\/at>\s*/g, '')
+      .replace(/@_user_\d+\s*/g, '')
+      .trim();
+  }
+
+  private async getChatMode(chatId: string, chatType: string): Promise<string> {
+    if (chatType === 'p2p') return 'p2p';
+
+    const cached = this.chatModeCache.get(chatId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.mode;
+    }
+
+    try {
+      const res = await this.client.im.chat.get({
+        path: { chat_id: chatId },
+      });
+      const data = res?.data || {};
+      const mode = data.group_message_type || data.chat_mode || 'chat';
+      this.chatModeCache.set(chatId, {
+        mode,
+        expiresAt: Date.now() + 10 * 60 * 1000,
+      });
+      logger.info('lark.chat_mode_loaded', {
+        chatId,
+        mode,
+        groupMessageType: data.group_message_type,
+        chatMode: data.chat_mode,
+      });
+      return mode;
+    } catch (err: any) {
+      logger.warn('lark.chat_mode_failed', { chatId, error: err?.message });
+      return 'chat';
+    }
+  }
+
+  private isTopicChatMode(mode: string): boolean {
+    const normalized = String(mode || '').toLowerCase();
+    return normalized === 'thread' || normalized === 'topic' || normalized === 'thread_v2';
+  }
+
+  private getOrCreateMessageSession(scope: string, chatId: string, chatType: string): Session {
+    let defaultWorkspace = this.config.agent.defaultWorkspace;
+    if (scope.startsWith('thread:') && chatType === 'group') {
+      const parentChatSession = sessionManager.getSession(`chat:${chatId}`);
+      if (parentChatSession?.workspace) {
+        defaultWorkspace = parentChatSession.workspace;
+      }
+    }
+
+    const session = sessionManager.getOrCreateSession(scope, defaultWorkspace);
+    if (scope.startsWith('thread:') && chatType === 'group') {
+      const parentChatSession = sessionManager.getSession(`chat:${chatId}`);
+      const inheritedWorkspace = parentChatSession?.workspace;
+      if (inheritedWorkspace && session.workspace === this.config.agent.defaultWorkspace && session.workspace !== inheritedWorkspace) {
+        logger.info('session.thread_workspace_inherited', { scope, from: session.workspace, to: inheritedWorkspace });
+        session.workspace = inheritedWorkspace;
+        session.conversationId = null;
+        sessionManager.saveSessions();
+      }
+    }
+    return session;
+  }
+
+  private parseMessageText(message: any): string {
+    if (!message) return '';
+
+    const messageType = message.msg_type || message.message_type;
+    const rawContent = message.body?.content || message.content;
+
+    if (message.deleted) return '[deleted message]';
+    if (messageType === 'image') return '[image message]';
+    if (!rawContent || typeof rawContent !== 'string') return '';
+
+    try {
+      const contentObj = JSON.parse(rawContent);
+      if (messageType === 'text') return this.stripMentions(contentObj.text || '');
+      if (messageType === 'post') return this.stripMentions(this.extractPostText(contentObj));
+      if (messageType === 'interactive') return this.extractInteractiveCardContent(rawContent);
+      return this.stripMentions(contentObj.text || contentObj.title || rawContent);
+    } catch (err) {
+      if (messageType === 'interactive') return this.extractInteractiveCardContent(rawContent);
+      return rawContent.trim();
+    }
+  }
+
+  private extractInteractiveCardContent(rawContent: string): string {
+    const parsed = this.tryParseJson(rawContent);
+    const userDsl = parsed && typeof parsed.user_dsl === 'string' && parsed.user_dsl.trim()
+      ? parsed.user_dsl.trim()
+      : '';
+    const rawForModel = userDsl || rawContent;
+    const contentObj = this.tryParseJson(rawForModel) || parsed;
+    const textParts = this.extractCardTextParts(contentObj);
+    const blocks: string[] = [];
+
+    if (textParts.length > 0) {
+      blocks.push([
+        '<interactive_card_text>',
+        truncateMiddle(textParts.join('\n'), 3000, 'interactive card text'),
+        '</interactive_card_text>',
+      ].join('\n'));
+    }
+
+    if (rawForModel.trim()) {
+      blocks.push([
+        '<interactive_card_raw>',
+        truncateMiddle(rawForModel, 4000, 'interactive card raw json'),
+        '</interactive_card_raw>',
+      ].join('\n'));
+    }
+
+    return blocks.join('\n\n');
+  }
+
+  private extractCardTextParts(value: any): string[] {
+    const parts: string[] = [];
+    const seen = new Set<any>();
+    const textKeys = new Set([
+      'content',
+      'text',
+      'title',
+      'subtitle',
+      'description',
+      'label',
+      'name',
+      'placeholder',
+      'alt',
+    ]);
+    const skipKeys = new Set([
+      'config',
+      'style',
+      'styles',
+      'behaviors',
+      'actions',
+      'action',
+      'value',
+      'values',
+      'url',
+      'href',
+      'image_key',
+      'img_key',
+      'icon',
+      'template',
+      'template_id',
+      'uuid',
+    ]);
+
+    const visit = (node: any, keyHint = '') => {
+      if (node === null || node === undefined) return;
+      if (typeof node === 'string') {
+        const trimmed = this.stripMentions(node).trim();
+        if (trimmed && (textKeys.has(keyHint) || keyHint === 'user_dsl')) {
+          parts.push(trimmed);
+        }
+        return;
+      }
+      if (typeof node !== 'object') return;
+      if (seen.has(node)) return;
+      seen.add(node);
+
+      if (Array.isArray(node)) {
+        for (const item of node) visit(item, keyHint);
+        return;
+      }
+
+      if (typeof node.user_dsl === 'string' && node.user_dsl.trim()) {
+        const dsl = this.tryParseJson(node.user_dsl);
+        if (dsl) visit(dsl, 'user_dsl');
+      }
+
+      for (const [key, child] of Object.entries(node)) {
+        if (skipKeys.has(key)) continue;
+        if (key === 'tag' || key === 'type' || key === 'schema') continue;
+        visit(child, key);
+      }
+    };
+
+    visit(value);
+    return Array.from(new Set(parts.map((part) => part.replace(/\s+\n/g, '\n').trim()).filter(Boolean)));
+  }
+
+  private tryParseJson(text: string): any | undefined {
+    try {
+      return JSON.parse(text);
+    } catch (err) {
+      return undefined;
+    }
+  }
+
+  private isQuoteDependentReply(text: string): boolean {
+    const normalized = text.replace(/\s+/g, '').trim();
+    if (!normalized) return true;
+    if (normalized.length > 40) return false;
+    return /(怎么看|你怎么看|这个呢|这呢|这条呢|啥意思|什么意思|对吗|可行吗|评价下|分析下|说说|意见)/.test(normalized);
+  }
+
+  private getQuotedMessageId(message: any): string {
+    const currentId = message?.message_id;
+    const candidates = [
+      message?.parent_id,
+      message?.root_id !== currentId ? message?.root_id : '',
+      message?.thread_id !== currentId ? message?.thread_id : '',
+    ];
+    return candidates.find((id) => typeof id === 'string' && id.trim()) || '';
+  }
+
+  private async fetchQuotedMessageContext(message: any): Promise<string> {
+    const quotedMessageId = this.getQuotedMessageId(message);
+    if (!quotedMessageId) return '';
+
+    try {
+      const res: any = await this.client.im.message.get({
+        params: {
+          card_msg_content_type: 'user_card_content',
+        },
+        path: {
+          message_id: quotedMessageId,
+        },
+      });
+      const quotedMessage = res?.data?.items?.[0];
+      const quotedText = this.parseMessageText(quotedMessage);
+      if (!quotedText) {
+        logger.info('message.quote_context_empty', { quotedMessageId });
+        return '';
+      }
+
+      logger.info('message.quote_context_attached', {
+        quotedMessageId,
+        quotedMessageType: quotedMessage?.msg_type,
+        quotedLength: quotedText.length,
+      });
+      return [
+        '<quoted_message>',
+        `message_id: ${quotedMessageId}`,
+        truncateMiddle(quotedText, 3000, 'quoted message'),
+        '</quoted_message>',
+      ].join('\n');
+    } catch (err: any) {
+      logger.warn('message.quote_context_fetch_failed', {
+        quotedMessageId,
+        error: err?.message,
+        code: err?.response?.data?.code,
+        msg: err?.response?.data?.msg,
+      });
+      return '';
+    }
+  }
+
   private extractPostImageKeys(contentObj: any): string[] {
     const content = contentObj.content || contentObj.zh_cn?.content || contentObj.en_us?.content || [];
     const imageKeys: string[] = [];
@@ -405,6 +684,9 @@ export class LarkGateway {
       `conversation_id: ${conversationText}`,
       '</bridge_context>',
       '<bridge_instructions>',
+      'If <user_message> contains <quoted_message>, it is the quoted/replied message the user is asking about; answer based on it first and do not repeat the XML tags.',
+      'If quoted_message contains <interactive_card_text> or <interactive_card_raw>, the user quoted a Feishu interactive card; prefer interactive_card_text and use raw JSON only as backup.',
+      'If the user asks a quote-dependent question but the quoted content is empty or unreadable, say that the quoted body was unavailable; do not guess or read local files to infer it.',
       '你叫陈陈，是通过飞书接入的 Antigravity 本地开发助手。',
       '默认使用中文回复，除非用户明确要求其他语言。',
       'bridge_context 是桥接层元数据，只用于理解上下文；不要在回复中复述这些字段。',
