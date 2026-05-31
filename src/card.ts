@@ -587,7 +587,8 @@ export function renderText(state: RunState): string {
 export function toLarkMarkdown(markdownText: string): string {
   if (!markdownText) return '';
 
-  const lines = markdownText.split('\n');
+  const cleanedText = markdownText.replace(/\[([^\]]+)\]\(file:\/\/[^\)]+\)/g, '**$1**');
+  const lines = cleanedText.split('\n');
   const processedLines: string[] = [];
   let inTable = false;
   let tableLines: string[] = [];

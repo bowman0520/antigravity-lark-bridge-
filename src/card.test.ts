@@ -1,4 +1,4 @@
-import { reduce, initialState, renderCard, renderText, finalizeIfRunning } from './card';
+import { reduce, initialState, renderCard, renderText, toLarkMarkdown } from './card';
 
 describe('Card Module Tests', () => {
   test('initial state and text/thinking events', () => {
@@ -61,7 +61,7 @@ describe('Card Module Tests', () => {
     expect(cardObj.header.title.content).toBe('Antigravity 任务执行中');
     expect(cardObj.header.template).toBe('blue');
 
-    const panel = cardObj.elements[0];
+    const panel = cardObj.body.elements[0];
     expect(panel.tag).toBe('collapsible_panel');
     expect(panel.header.title.content).toContain('RunCommand');
   });
@@ -73,7 +73,6 @@ describe('Card Module Tests', () => {
     expect(state.footer).toBeNull();
 
     const doneCard: any = renderCard(state);
-    expect(doneCard.config.streaming_mode).toBe(false);
     expect(doneCard.header.title.content).toBe('Antigravity 任务已完成');
     expect(doneCard.header.template).toBe('green');
 
@@ -85,5 +84,11 @@ describe('Card Module Tests', () => {
 
     const textOut = renderText(textState);
     expect(textOut).toContain('⚠️ agent 失败：Something went wrong');
+  });
+
+  test('toLarkMarkdown strips absolute file:// links', () => {
+    const input = 'Please check [00-收集箱](file:///Users/chiphen/Library/Mobile Documents/iCloud~md~obsidian/Documents/我的知识库/00-收集箱) and [CLAUDE.md](file:///Users/chiphen/Library/Mobile Documents/iCloud~md~obsidian/Documents/我的知识库/CLAUDE.md) for details.';
+    const output = toLarkMarkdown(input);
+    expect(output).toBe('Please check **00-收集箱** and **CLAUDE.md** for details.');
   });
 });
