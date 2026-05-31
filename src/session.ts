@@ -20,7 +20,6 @@ export interface Session {
   pendingQueue: string[];
   lastActive: string;
   summary: string;
-  recentMessages: string[];
 }
 
 export interface PersistentSessionData {
@@ -28,7 +27,6 @@ export interface PersistentSessionData {
   conversationId: string | null;
   lastActive: string;
   summary?: string;
-  recentMessages?: string[];
 }
 
 class SessionManager {
@@ -57,7 +55,6 @@ class SessionManager {
             pendingQueue: [],
             lastActive: sessionData.lastActive,
             summary: sessionData.summary || '',
-            recentMessages: sessionData.recentMessages || [],
           });
         }
       } catch (err) {
@@ -74,7 +71,6 @@ class SessionManager {
         conversationId: session.conversationId,
         lastActive: session.lastActive,
         summary: session.summary,
-        recentMessages: session.recentMessages,
       };
     }
 
@@ -99,7 +95,6 @@ class SessionManager {
         pendingQueue: [],
         lastActive: new Date().toISOString(),
         summary: '',
-        recentMessages: [],
       };
       this.sessions.set(scope, session);
       this.saveSessions();
@@ -137,7 +132,6 @@ class SessionManager {
     session.status = 'IDLE';
     session.pendingQueue = [];
     session.summary = '';
-    session.recentMessages = [];
     session.lastActive = new Date().toISOString();
     delete (session as any).activeRunHandle;
     delete (session as any).activeTaskCardMessageId;
@@ -146,27 +140,12 @@ class SessionManager {
     return session;
   }
 
-  public appendExchange(scope: string, userText: string, assistantText: string) {
+  public touchActive(scope: string) {
     const session = this.sessions.get(scope);
     if (!session) return;
-
-    session.recentMessages.push(`用户: ${this.compactText(userText, 600)}`);
-    session.recentMessages.push(`陈陈: ${this.compactText(assistantText, 240)}`);
-
-    while (session.recentMessages.length > 8) {
-      session.recentMessages.shift();
-    }
-
-    session.summary = '';
-
     session.lastActive = new Date().toISOString();
+    session.summary = '';
     this.saveSessions();
-  }
-
-  private compactText(text: string, maxChars: number): string {
-    const normalized = text.replace(/�/g, '').replace(/\s+/g, ' ').trim();
-    if (normalized.length <= maxChars) return normalized;
-    return `${normalized.slice(0, maxChars)}…`;
   }
 
   // Check if a workspace is locked by another running session

@@ -1,6 +1,6 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
-import { execFileSync } from 'child_process';
 import { ResolvedConfig } from './config';
 import { WORKSPACES_FILE, ANTIGRAVITY_IDE_STATE_DB, ANTIGRAVITY_STATE_DB, getAntigravityBrainDir, getAntigravityCliBrainDir } from './paths';
 
@@ -55,26 +55,48 @@ export function getAllowedWorkspaces(): string[] {
   }
 }
 
-export function getBrainDir(): string {
+export function getBrainDir(workspace?: string): string {
+  if (workspace) {
+    const wsDir = path.join(workspace, '.antigravitycli', 'brain');
+    if (fs.existsSync(wsDir)) return wsDir;
+  }
   const cliDir = getAntigravityCliBrainDir();
   if (fs.existsSync(cliDir)) return cliDir;
   return getAntigravityBrainDir();
 }
 
+
 function readRecentPathsFromDb(dbPath: string): string[] {
   if (!fs.existsSync(dbPath)) return [];
+  let tmpPath: string | undefined;
   try {
-    const raw = execFileSync('sqlite3', [dbPath, "SELECT value FROM ItemTable WHERE key = 'history.recentlyOpenedPathsList'"], {
-      encoding: 'utf8',
-      timeout: 5000,
-    });
-    const parsed = JSON.parse(raw);
+    const Database = require('better-sqlite3');
+    // Copy to temp file on Windows — better-sqlite3 cannot open DBs locked by another process
+    const openPath = process.platform === 'win32' ? (() => {
+      tmpPath = path.join(os.tmpdir(), `state_${Date.now()}.vscdb`);
+      fs.copyFileSync(dbPath, tmpPath);
+      return tmpPath;
+    })() : dbPath;
+    const db = new Database(openPath, { readonly: true });
+    const row = db.prepare("SELECT value FROM ItemTable WHERE key = 'history.recentlyOpenedPathsList'").get() as { value: string } | undefined;
+    db.close();
+    if (tmpPath) { try { fs.unlinkSync(tmpPath); } catch {} }
+    if (!row?.value) return [];
+    const parsed = JSON.parse(row.value);
     const entries: Array<{ folderUri?: string }> = parsed?.entries || [];
     return entries
       .map(e => e.folderUri)
       .filter((u): u is string => typeof u === 'string' && u.startsWith('file://'))
-      .map(u => decodeURIComponent(u.replace(/^file:\/\//, '')));
+      .map(u => {
+        let p = decodeURIComponent(u.replace(/^file:\/\//, ''));
+        // Windows: file:///c%3A/... decodes to /c:/... — strip leading slash
+        if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(p)) {
+          p = p.slice(1);
+        }
+        return p;
+      });
   } catch {
+    if (tmpPath) { try { fs.unlinkSync(tmpPath); } catch {} }
     return [];
   }
 }

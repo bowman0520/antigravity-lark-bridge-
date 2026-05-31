@@ -1,4 +1,4 @@
-#!/usr/bin/env ts-node
+#!/usr/bin/env node
 import * as fs from 'fs';
 import { Command } from 'commander';
 import { loadConfig, migratePlaintextSecrets, ResolvedConfig } from './config';
@@ -12,7 +12,7 @@ import { CONFIG_FILE } from './paths';
 import { runSetupWizard } from './wizard';
 import { formatDoctorChecks, runDoctor } from './doctor';
 import { findConflicts, killProcess, listProcesses, registerProcess, unregisterProcess } from './processRegistry';
-import { getServiceStatus, registerService, restartService, startService, stopService, unregisterService } from './daemon/serviceAdapter';
+import { ensureServiceStarted, getServiceHealthStatus, restartService, stopService, unregisterService } from './daemon/serviceAdapter';
 import {
   buildPayloadTooLargeDecision,
   byteLength,
@@ -32,10 +32,9 @@ program
   .command('start')
   .description('Register and start the user-level bridge service')
   .option('-c, --config <path>', 'path to configuration file')
-  .action((options) => {
-    registerService({ configPath: options.config || CONFIG_FILE });
-    startService();
-    console.log('Bridge service registered and start requested.');
+  .action(async (options) => {
+    const status = await ensureServiceStarted({ configPath: options.config || CONFIG_FILE });
+    console.log(`installed=${status.installed} running=${status.running} ${status.message}`);
   });
 
 program
@@ -58,8 +57,8 @@ program
 program
   .command('status')
   .description('Show user-level bridge service status')
-  .action(() => {
-    const status = getServiceStatus();
+  .action(async () => {
+    const status = await getServiceHealthStatus();
     console.log(`installed=${status.installed} running=${status.running} ${status.message}`);
   });
 

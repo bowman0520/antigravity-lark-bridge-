@@ -1,8 +1,11 @@
 import * as fs from 'fs';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
-import { APP_DIR, CONFIG_FILE } from '../paths';
+import { APP_DIR, CONFIG_FILE, RUNTIME_FILE } from '../paths';
+import { listProcesses } from '../processRegistry';
+import { deleteRuntime } from '../runtime';
 
 const SERVICE_LABEL = 'com.antigravity-lark-bridge';
 
@@ -19,6 +22,9 @@ export interface ServiceStatus {
 export function registerService(options: ServiceOptions = {}) {
   const file = getServiceFilePath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (process.platform === 'win32') {
+    fs.writeFileSync(getHiddenLauncherPath(), renderWindowsHiddenLauncher(options.configPath || CONFIG_FILE), { mode: 0o600, encoding: 'utf8' });
+  }
   fs.writeFileSync(file, renderServiceDefinition(options.configPath || CONFIG_FILE), { mode: 0o600, encoding: 'utf8' });
   if (process.platform === 'darwin') {
     run('launchctl', ['bootstrap', `gui/${process.getuid?.()}`, file], true);
@@ -36,10 +42,30 @@ export function startService() {
   else if (process.platform === 'win32') run('schtasks', ['/Run', '/TN', SERVICE_LABEL], true);
 }
 
+export async function ensureServiceStarted(options: ServiceOptions = {}): Promise<ServiceStatus> {
+  registerService(options);
+
+  if (process.platform === 'win32') {
+    const before = await getServiceHealthStatus();
+    if (before.running) return before;
+    terminateRegisteredBridgeProcesses();
+    cleanupStaleRuntimeState();
+  }
+
+  startService();
+  return process.platform === 'win32'
+    ? await waitForHealthyStatus()
+    : getServiceStatus();
+}
+
 export function stopService() {
   if (process.platform === 'darwin') run('launchctl', ['bootout', `gui/${process.getuid?.()}/${SERVICE_LABEL}`], true);
   else if (process.platform === 'linux') run('systemctl', ['--user', 'stop', SERVICE_LABEL], true);
-  else if (process.platform === 'win32') run('schtasks', ['/End', '/TN', SERVICE_LABEL], true);
+  else if (process.platform === 'win32') {
+    run('schtasks', ['/End', '/TN', SERVICE_LABEL], true);
+    terminateRegisteredBridgeProcesses();
+    cleanupStaleRuntimeState();
+  }
 }
 
 export function restartService(options: ServiceOptions = {}) {
@@ -98,6 +124,35 @@ export function getServiceStatus(): ServiceStatus {
   return { installed, running: false, message: `Unsupported platform: ${process.platform}` };
 }
 
+export async function getServiceHealthStatus(): Promise<ServiceStatus> {
+  const installed = fs.existsSync(getServiceFilePath());
+  if (process.platform !== 'win32') {
+    return getServiceStatus();
+  }
+
+  const taskResult = spawnSync('schtasks', ['/Query', '/TN', SERVICE_LABEL], { encoding: 'utf8' });
+  const taskRegistered = taskResult.status === 0;
+  const processes = listProcesses();
+  const runtime = readRuntimeFile();
+  const runtimePidAlive = runtime ? isPidAlive(runtime.pid) : false;
+  const ipcListening = runtime ? await isTcpPortListening(runtime.port) : false;
+  const running = taskRegistered && processes.length > 0 && runtimePidAlive && ipcListening;
+
+  const processText = processes.length > 0
+    ? processes.map((record) => `${record.id}:${record.pid}`).join(',')
+    : 'none';
+  const runtimeText = runtime
+    ? `pid=${runtime.pid} pidAlive=${runtimePidAlive} port=${runtime.port} ipc=${ipcListening ? 'ok' : 'down'}`
+    : 'missing';
+  const taskText = taskRegistered ? 'registered' : 'not registered';
+
+  return {
+    installed,
+    running,
+    message: `Task ${taskText}; bridge ${running ? 'healthy' : 'not healthy'}; processes=${processText}; runtime=${runtimeText}`,
+  };
+}
+
 export function getServiceFilePath(): string {
   if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`);
   if (process.platform === 'linux') return path.join(os.homedir(), '.config', 'systemd', 'user', `${SERVICE_LABEL}.service`);
@@ -152,11 +207,97 @@ WantedBy=default.target
 `;
   }
 
+  const hiddenLauncher = getHiddenLauncherPath();
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Actions Context="Author"><Exec><Command>${process.execPath}</Command><Arguments>${cliPath} run --config ${configPath}</Arguments></Exec></Actions>
+  <Actions Context="Author"><Exec><Command>wscript.exe</Command><Arguments>//B //NoLogo "${escapeXml(hiddenLauncher)}"</Arguments></Exec></Actions>
 </Task>
 `;
+}
+
+function getHiddenLauncherPath(): string {
+  return path.join(APP_DIR, 'hidden-start.vbs');
+}
+
+function renderWindowsHiddenLauncher(configPath: string, cliPath = getCliPath()): string {
+  return [
+    "' Hidden launcher for antigravity-lark-bridge",
+    "' Runs the node bridge with no visible console window.",
+    'Set WshShell = CreateObject("WScript.Shell")',
+    `WshShell.Run "${escapeVbsArg(process.execPath)} ${escapeVbsArg(cliPath)} run --config ${escapeVbsArg(configPath)}", 0, False`,
+    '',
+  ].join('\r\n');
+}
+
+async function waitForHealthyStatus(timeoutMs = 8000): Promise<ServiceStatus> {
+  const startedAt = Date.now();
+  let last = await getServiceHealthStatus();
+  while (!last.running && Date.now() - startedAt < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    last = await getServiceHealthStatus();
+  }
+  return last;
+}
+
+function cleanupStaleRuntimeState() {
+  listProcesses();
+  const runtime = readRuntimeFile();
+  if (runtime && (!isPidAlive(runtime.pid) || !runtime.port)) {
+    deleteRuntime();
+  }
+}
+
+function terminateRegisteredBridgeProcesses() {
+  for (const record of listProcesses()) {
+    try {
+      process.kill(record.pid, 'SIGTERM');
+    } catch {
+      // Process registry is best-effort; listProcesses prunes stale entries.
+    }
+  }
+
+  const start = Date.now();
+  while (Date.now() - start < 2500 && listProcesses().length > 0) {
+    spawnSync(process.execPath, ['-e', 'setTimeout(() => {}, 100)']);
+  }
+}
+
+function readRuntimeFile(): { port: number; pid: number } | null {
+  try {
+    if (!fs.existsSync(RUNTIME_FILE)) return null;
+    const parsed = JSON.parse(fs.readFileSync(RUNTIME_FILE, 'utf8'));
+    if (typeof parsed?.port !== 'number' || typeof parsed?.pid !== 'number') return null;
+    return { port: parsed.port, pid: parsed.pid };
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return err.code === 'EPERM';
+  }
+}
+
+function isTcpPortListening(port: number, host = '127.0.0.1', timeoutMs = 700): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+    socket.connect(port, host);
+  });
 }
 
 function sanitizePath(value: string): string {
@@ -168,6 +309,18 @@ function sanitizePath(value: string): string {
 
 function getCliPath(): string {
   return process.argv[1] ? path.resolve(process.argv[1]) : path.resolve(__dirname, '..', 'cli.js');
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function escapeVbsArg(value: string): string {
+  return `""${value.replace(/"/g, '""""')}""`;
 }
 
 function run(command: string, args: string[], ignoreFailure = false) {

@@ -34,6 +34,7 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.24.0",
+    "better-sqlite3": "^12.10.0",
     "commander": "^11.1.0",
     "pino": "^8.19.0",
     "proper-lockfile": "^4.1.2",
@@ -44,6 +45,7 @@
     "axios": "^1.16.1"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/jest": "^29.5.12",
     "@types/node": "^20.11.24",
     "@types/proper-lockfile": "^4.1.3",

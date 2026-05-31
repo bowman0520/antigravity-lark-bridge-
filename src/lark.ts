@@ -233,6 +233,7 @@ export class LarkGateway {
                (this.botName && mentionName === this.botName);
       });
       if (this.config.reply.requireMentionInGroup && !isMentioned) {
+        logger.info('message.ignored_no_mention', { chatId, botOpenId: this.botOpenId, mentions: message.mentions });
         return;
       }
     }
@@ -294,6 +295,7 @@ export class LarkGateway {
         `- /doctor : 运行桥接自诊断（管理员）\n` +
         `- /list (或 /ws) : 查看和切换当前工作空间与历史会话\n` +
         `- /stop : 停止当前正在执行的 Agent 任务\n` +
+        `- /cd <路径> : 切换工作区到指定路径\n` +
         `- /task : 长任务模式，最多等待 10 分钟\n` +
         `- /long : 同 /task\n` +
         `- /reconnect : 触发连接刷新\n\n` +
@@ -326,6 +328,19 @@ export class LarkGateway {
         return;
       }
       await this.replyText(msgId, '🔄 WebSocket 连接在线，已刷新。');
+    } else if (primary === '/cd') {
+      const targetPath = parts.slice(1).join(' ').trim();
+      if (!targetPath) {
+        await this.replyText(msgId, `当前工作区: \`${session.workspace}\`\n用法: /cd <路径>`);
+        return;
+      }
+      if (!fs.existsSync(targetPath)) {
+        await this.replyText(msgId, `❌ 路径不存在: ${targetPath}`);
+        return;
+      }
+      session.workspace = targetPath;
+      sessionManager.saveSessions();
+      await this.replyText(msgId, `✅ 工作区已切换到: \`${targetPath}\``);
     } else if (primary === '/list' || primary === '/ws') {
       const card = this.buildListCard(session);
       try {
@@ -659,10 +674,8 @@ export class LarkGateway {
     const promptArr = Array.isArray(userPrompts) ? userPrompts : [userPrompts];
     const userPrompt = promptArr.join('\n\n');
     const isChitChat = promptArr.length === 1 && this.isPureChitChat(promptArr[0]);
-    const recentContext = !isChitChat && session.recentMessages.length > 0
-      ? `<recent_messages>\n${session.recentMessages.slice(-8).join('\n')}\n</recent_messages>`
-      : '';
-    const shortReplyHint = promptArr.length === 1 && this.isContextDependentReply(promptArr[0])
+    const isP2p = scope.startsWith('p2p:');
+    const shortReplyHint = isP2p && promptArr.length === 1 && this.isContextDependentReply(promptArr[0])
       ? '用户当前消息很短，必须优先结合最近对话判断它是在选择、确认、追问、催办还是要求切换语言；不要把它当成孤立的新任务。'
       : '';
     const chitChatHint = isChitChat
@@ -675,7 +688,7 @@ export class LarkGateway {
 
     return [
       '<bridge_context>',
-      'bot_name: 陈陈',
+      'bot_name: 小G',
       'channel: feishu',
       `scope: ${scope}`,
       `chat_id: ${scope.split(':')[1] || ''}`,
@@ -687,12 +700,12 @@ export class LarkGateway {
       'If <user_message> contains <quoted_message>, it is the quoted/replied message the user is asking about; answer based on it first and do not repeat the XML tags.',
       'If quoted_message contains <interactive_card_text> or <interactive_card_raw>, the user quoted a Feishu interactive card; prefer interactive_card_text and use raw JSON only as backup.',
       'If the user asks a quote-dependent question but the quoted content is empty or unreadable, say that the quoted body was unavailable; do not guess or read local files to infer it.',
-      '你叫陈陈，是通过飞书接入的 Antigravity 本地开发助手。',
+      '你叫小G，是通过飞书接入的 Antigravity 本地开发助手。',
       '默认使用中文回复，除非用户明确要求其他语言。',
       'bridge_context 是桥接层元数据，只用于理解上下文；不要在回复中复述这些字段。',
-      '这是连续飞书会话；如果底层 CLI 没有可用 conversationId，也必须根据 recent_messages 延续上下文。',
-      '不要把孤立的数字、同意、继续、用中文、问号、好了没当成全新需求；它们通常是在回应上一轮选项或追问上一轮任务。',
-      'recent_messages 只是上下文参考，绝不可因为里面在讨论某个代码任务，就主动重新检索、读取文件、运行命令或重启那个任务。是否要执行工具，只看当前的 <user_message> 是不是明确要求执行。',
+      '如果 user_message 里包含 <quoted_message>，它就是用户当前引用回复所指向的内容，必须优先围绕它回答；不要把 XML 标签原样复述给用户。',
+      '如果 quoted_message 里包含 <interactive_card_text> 或 <interactive_card_raw>，说明用户引用的是飞书交互卡片；先根据 interactive_card_text 理解，必要时再参考 raw JSON。',
+      '如果用户问“怎么看/这个呢”等依赖引用的问题，但引用内容为空、不可读或只有占位符，必须说明没有拿到引用正文；不要自行读取本地文件、不要猜测用户指的是哪个项目。',
       '当 <user_message> 内容很短或只是打招呼/确认/感叹（如 hi、你好、在吗、收到、好的、谢谢）时，只用一两句话简短回复，禁止主动调用任何工具。',
       '当用户表达抱怨、疑问或闲聊（如"卡住了吗"、"什么情况"、"为啥还没好"、"能不能..."），先直接用对话回应；不要主动读代码、跑命令、翻 bridge 实现去排查，除非用户明确说"帮我看一下代码"或"调试一下"。',
       '【发送图片/文件/视频到飞书】生成或准备好本地文件后，必须用 lark-cli 主动发到当前对话，不要只在文本里写 ![](file://...)。命令模板：`lark-cli im +messages-send --chat-id <chat_id> --media-path <绝对路径>`，其中 chat_id 取自 bridge_context.chat_id。发完之后简短一句话告诉用户已发送即可，不要再贴本地路径。',
@@ -700,7 +713,6 @@ export class LarkGateway {
       chitChatHint,
       batchHint,
       '</bridge_instructions>',
-      recentContext,
       '<user_message>',
       userPrompt,
       '</user_message>',
@@ -854,7 +866,7 @@ export class LarkGateway {
       }
 
       sessionManager.setStatus(scope, 'COMPLETED');
-      sessionManager.appendExchange(scope, rawPrompt, finalResult);
+      sessionManager.touchActive(scope);
       logger.info('agent.completed', { scope });
 
       // Use finalResult as fallback only when transcript polling yielded no text
@@ -1610,7 +1622,7 @@ export class LarkGateway {
 
   private buildWorkspaceSessionText(session: Session): string {
     const workspaces = [...getAllowedWorkspaces(), ...getAntigravityProjects()].filter((v, i, a) => a.indexOf(v) === i).slice(0, 5).map((ws, index) => `${index + 1}. ${ws}`).join('\n') || '无可用工作区';
-    const conversations = this.getRecentConversations().slice(0, 5).map((item, index) => `${index + 1}. ${item.summary} (${item.id.slice(0, 8)})`).join('\n') || '暂无历史会话';
+    const conversations = this.getRecentConversations(session.workspace).slice(0, 5).map((item, index) => `${index + 1}. ${item.summary} (${item.id.slice(0, 8)})`).join('\n') || '暂无历史会话';
     return `当前工作区: ${session.workspace}\n当前会话: ${session.conversationId || '新建会话'}\n\n可用工作区:\n${workspaces}\n\n最近会话:\n${conversations}`;
   }
 
@@ -1659,7 +1671,7 @@ export class LarkGateway {
       };
     });
 
-    const recent = this.getRecentConversations();
+    const recent = this.getRecentConversations(session.workspace);
     const sessionOptions = [
       {
         text: {
@@ -1827,9 +1839,9 @@ export class LarkGateway {
     return cleaned;
   }
 
-  private getRecentConversations(): Array<{ id: string; summary: string }> {
+  private getRecentConversations(workspace?: string): Array<{ id: string; summary: string }> {
     try {
-      const brainDir = getBrainDir();
+      const brainDir = getBrainDir(workspace);
       if (!fs.existsSync(brainDir)) return [];
 
       const files = fs.readdirSync(brainDir);

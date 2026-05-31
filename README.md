@@ -178,6 +178,16 @@ Common commands:
 
 Admin-sensitive commands are checked with `access.admins`. Empty `admins` preserves legacy unrestricted behavior, but QR-created configs set the scanner as admin by default.
 
+### Conversation continuity
+
+Every chat scope keeps its own sticky Antigravity conversation (passed via `--conversation`). The bridge does NOT replay recent turns inside the prompt — the agent's own session is the single source of truth. Scope is derived as:
+
+- `p2p:<chat_id>` for direct messages
+- `thread:<chat_id>:<thread_id>` when the message belongs to a topic thread or replies to an earlier message (Feishu `thread_id` / `root_id` / `parent_id`)
+- `chat:<chat_id>` for plain group `@`-mentions
+
+To switch topics in any scope, send `/new` to clear the conversation id.
+
 ## Service and process commands
 
 The bridge has a process registry to detect duplicate bot processes for the same app. Useful host CLI commands:

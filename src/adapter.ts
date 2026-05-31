@@ -51,12 +51,12 @@ const ALLOWED_STEP_TYPES = new Set<string>([
 const TRANSCRIPT_SIZE_WARN_THRESHOLD = 5 * 1024 * 1024;
 const FINAL_TEXT_IDLE_MS = 20 * 1000;
 
-function getTranscriptPath(id: string): string {
-  return path.join(getBrainDir(), id, '.system_generated', 'logs', 'transcript.jsonl');
+function getTranscriptPath(workspace: string, id: string): string {
+  return path.join(getBrainDir(workspace), id, '.system_generated', 'logs', 'transcript.jsonl');
 }
 
-function getInitialMaxStepIndex(id: string): number {
-  const transcriptPath = getTranscriptPath(id);
+function getInitialMaxStepIndex(workspace: string, id: string): number {
+  const transcriptPath = getTranscriptPath(workspace, id);
   if (fs.existsSync(transcriptPath)) {
     try {
       const rawContent = fs.readFileSync(transcriptPath, 'utf8');
@@ -80,8 +80,8 @@ function getInitialMaxStepIndex(id: string): number {
   return -1;
 }
 
-function getBaselineBytes(id: string): number {
-  const transcriptPath = getTranscriptPath(id);
+function getBaselineBytes(workspace: string, id: string): number {
+  const transcriptPath = getTranscriptPath(workspace, id);
   if (!fs.existsSync(transcriptPath)) return 0;
   try {
     return fs.statSync(transcriptPath).size;
@@ -120,6 +120,10 @@ export function runAgent(
     childEnv.LC_CTYPE = 'zh_CN.UTF-8';
   }
 
+  // Isolate memory, rules, and cache directories in the workspace
+  childEnv.CLAUDE_CONFIG_DIR = path.join(input.workspace, '.claude');
+  childEnv.ANTIGRAVITY_APP_DATA_DIR = path.join(input.workspace, '.antigravitycli');
+
   const child = spawn(config.agent.command, args, {
     cwd: input.workspace,
     env: childEnv,
@@ -133,6 +137,7 @@ export function runAgent(
     child.stderr.setEncoding('utf8');
   }
 
+  const startedWithSession = Boolean(input.sessionId);
   let conversationId: string | null = input.sessionId || null;
   let lastPlannerResponse = '';
   let baselineBytes = 0;
@@ -140,9 +145,9 @@ export function runAgent(
   let initialMaxStepIndex = -1;
 
   if (conversationId) {
-    baselineBytes = getBaselineBytes(conversationId);
+    baselineBytes = getBaselineBytes(input.workspace, conversationId);
     lastReadOffset = baselineBytes;
-    initialMaxStepIndex = getInitialMaxStepIndex(conversationId);
+    initialMaxStepIndex = getInitialMaxStepIndex(input.workspace, conversationId);
     logger.info('agent.baseline_set', {
       scope: input.scope,
       conversationId,
@@ -245,40 +250,54 @@ export function runAgent(
         if (isSettled) return;
         isSettled = true;
         isRunning = false;
-        cleanup();
-        // Give one final poll to ensure we get any final logs
-        if (conversationId) {
-          pollTranscript(conversationId);
-        } else {
-          const discoveredId = discoverConversationId(input.workspace, startedAt, runLogPath);
-          if (discoveredId) {
-            rememberConversationId(discoveredId);
-            pollTranscript(discoveredId);
+
+        // Delay final settle to give transcript writes time to flush to disk,
+        // especially for fast-completing short conversations where agy exits
+        // before the transcript file is fully written.
+        setTimeout(() => {
+          cleanup();
+          if (conversationId) {
+            pollTranscript(conversationId);
+          } else {
+            const discoveredId = discoverConversationId(input.workspace, startedAt, runLogPath);
+            if (discoveredId) {
+              rememberConversationId(discoveredId);
+              pollTranscript(discoveredId);
+              cleanup();
+            }
           }
-        }
 
-        const runLog = readTextIfExists(runLogPath);
-        const cliFailure = detectCliFailure(`${stderrBuffer}\n${stdoutBuffer}\n${runLog}`);
-        const resolvedText = lastPlannerResponse || stdoutBuffer.trim();
+          const runLog = readTextIfExists(runLogPath);
+          const cliFailure = detectCliFailure(`${stderrBuffer}\n${stdoutBuffer}\n${runLog}`);
+          const resolvedText = lastPlannerResponse || stdoutBuffer.trim();
 
-        if (isStopped) {
-          reject(new Error('Task cancelled by user /stop command.'));
-        } else if (isTimedOut) {
-          reject(new Error(`Antigravity CLI timed out after ${Math.round(timeoutMs / 1000)} seconds.`));
-        } else if (cliFailure) {
-          reject(new Error(cliFailure));
-        } else if (code !== 0) {
-          const exitReason = code === null ? `signal ${signal || 'unknown'}` : `code ${code}`;
-          reject(new Error(`Agent process exited with ${exitReason}. Stderr: ${stderrBuffer.trim()}`));
-        } else {
-          resolve(resolvedText || '任务执行完毕，但未返回文本响应。');
-        }
+          if (isStopped) {
+            reject(new Error('Task cancelled by user /stop command.'));
+          } else if (isTimedOut) {
+            reject(new Error(`Antigravity CLI timed out after ${Math.round(timeoutMs / 1000)} seconds.`));
+          } else if (cliFailure) {
+            reject(new Error(cliFailure));
+          } else if (signal === 'SIGTERM' && lastPlannerResponse) {
+            // Watchdog kill after final text — treat as success
+            resolve(resolvedText);
+          } else if (code !== 0) {
+            const exitReason = code === null ? `signal ${signal || 'unknown'}` : `code ${code}`;
+            reject(new Error(`Agent process exited with ${exitReason}. Stderr: ${stderrBuffer.trim()}`));
+          } else {
+            resolve(resolvedText);
+          }
+        }, 300);
       };
 
       // Resolve on exit as well as close. Some CLI tools leave inherited stdio
       // open through helper processes, which can prevent `close` from firing.
-      child.on('exit', settle);
-      child.on('close', settle);
+      // Delay by 150ms so transcript writes can fully flush after agy exits.
+      const settleDeferred = (code: number | null, signal?: NodeJS.Signals | null) => {
+        if (isSettled) return;
+        setTimeout(() => settle(code, signal), 150);
+      };
+      child.on('exit', settleDeferred);
+      child.on('close', settleDeferred);
     }),
     conversationId,
     pid: child.pid || null,
@@ -308,12 +327,18 @@ export function runAgent(
     handle.conversationId = id;
     sessionManager.setConversationId(input.scope, id);
     logger.info('agent.conversation_identified', { scope: input.scope, conversationId: id });
-    if (initialMaxStepIndex === -1) {
-      initialMaxStepIndex = getInitialMaxStepIndex(id);
-    }
-    if (baselineBytes === 0 && lastReadOffset === 0) {
-      baselineBytes = getBaselineBytes(id);
-      lastReadOffset = baselineBytes;
+    if (startedWithSession) {
+      if (initialMaxStepIndex === -1) {
+        initialMaxStepIndex = getInitialMaxStepIndex(input.workspace, id);
+      }
+      if (baselineBytes === 0 && lastReadOffset === 0) {
+        baselineBytes = getBaselineBytes(input.workspace, id);
+        lastReadOffset = baselineBytes;
+      }
+    } else {
+      initialMaxStepIndex = -1;
+      baselineBytes = 0;
+      lastReadOffset = 0;
     }
     startPollingTranscript(id);
   }
@@ -326,7 +351,7 @@ export function runAgent(
   }
 
   function pollTranscript(id: string) {
-    const transcriptPath = getTranscriptPath(id);
+    const transcriptPath = getTranscriptPath(input.workspace, id);
 
     if (!fs.existsSync(transcriptPath)) {
       return;
@@ -547,11 +572,11 @@ function discoverConversationId(workspace: string, startedAt: number, runLogPath
   const fromCache = readConversationIdFromCache(workspace, startedAt);
   if (fromCache) return fromCache;
 
-  return findNewestTranscriptConversation(startedAt);
+  return findNewestTranscriptConversation(workspace, startedAt);
 }
 
 function readConversationIdFromCache(workspace: string, startedAt: number): string | null {
-  const cachePath = getAntigravityLastConversationsFile();
+  const cachePath = getAntigravityLastConversationsFile(workspace);
   try {
     if (!fs.existsSync(cachePath)) return null;
     const stat = fs.statSync(cachePath);
@@ -565,8 +590,8 @@ function readConversationIdFromCache(workspace: string, startedAt: number): stri
   }
 }
 
-function findNewestTranscriptConversation(startedAt: number): string | null {
-  const brainDir = getBrainDir();
+function findNewestTranscriptConversation(workspace: string, startedAt: number): string | null {
+  const brainDir = getBrainDir(workspace);
   try {
     if (!fs.existsSync(brainDir)) return null;
     let best: { id: string; mtimeMs: number } | null = null;
