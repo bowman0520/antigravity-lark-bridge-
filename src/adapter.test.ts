@@ -6,6 +6,8 @@ import * as path from 'path';
 import * as os from 'os';
 import { EventEmitter } from 'events';
 
+let mockTranscriptContent = '';
+
 jest.mock('child_process');
 jest.mock('fs', () => {
   const actualFs = jest.requireActual('fs');
@@ -14,6 +16,10 @@ jest.mock('fs', () => {
     existsSync: jest.fn(),
     readFileSync: jest.fn(),
     readdirSync: jest.fn(),
+    statSync: jest.fn(),
+    openSync: jest.fn(),
+    readSync: jest.fn(),
+    closeSync: jest.fn(),
   };
 });
 
@@ -74,6 +80,7 @@ describe('Agent Adapter Tests', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest.useFakeTimers();
+    mockTranscriptContent = '';
 
     mockChild = new EventEmitter() as any;
     mockChild.stdout = new EventEmitter();
@@ -85,11 +92,40 @@ describe('Agent Adapter Tests', () => {
     // Default fs implementation redirects to actual fs
     (fs.existsSync as jest.Mock).mockImplementation((p) => {
       if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
-        return false;
+        return mockTranscriptContent !== '';
       }
       return actualFs.existsSync(p);
     });
-    (fs.readFileSync as jest.Mock).mockImplementation((p, opt) => actualFs.readFileSync(p, opt));
+    (fs.readFileSync as jest.Mock).mockImplementation((p, opt) => {
+      if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
+        return mockTranscriptContent;
+      }
+      return actualFs.readFileSync(p, opt);
+    });
+    (fs.statSync as jest.Mock).mockImplementation((p) => {
+      if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
+        return { size: Buffer.byteLength(mockTranscriptContent, 'utf8') };
+      }
+      return actualFs.statSync(p);
+    });
+    (fs.openSync as jest.Mock).mockImplementation((p, flags) => {
+      if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
+        return 999;
+      }
+      return actualFs.openSync(p, flags);
+    });
+    (fs.readSync as jest.Mock).mockImplementation((fd, buf, offset, length, position) => {
+      if (fd === 999) {
+        const contentBuf = Buffer.from(mockTranscriptContent, 'utf8');
+        const bytesRead = contentBuf.copy(buf, offset, position, position + length);
+        return bytesRead;
+      }
+      return actualFs.readSync(fd, buf, offset, length, position);
+    });
+    (fs.closeSync as jest.Mock).mockImplementation((fd) => {
+      if (fd === 999) return;
+      return actualFs.closeSync(fd);
+    });
     (fs.readdirSync as jest.Mock).mockImplementation(() => []);
   });
 
@@ -121,26 +157,11 @@ describe('Agent Adapter Tests', () => {
     expect(handle.conversationId).toBe('conv_abc');
     expect(handle.isRunning()).toBe(true);
 
-    // Setup transcript mocks
-    (fs.existsSync as jest.Mock).mockImplementation((p) => {
-      if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
-        return true;
-      }
-      return actualFs.existsSync(p);
-    });
-
-    const mockTranscriptLine = JSON.stringify({
+    mockTranscriptContent = JSON.stringify({
       type: 'PLANNER_RESPONSE',
       step_index: 0,
       content: 'This is the output from agent.',
     }) + '\n';
-
-    (fs.readFileSync as jest.Mock).mockImplementation((p, opt) => {
-      if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
-        return mockTranscriptLine;
-      }
-      return actualFs.readFileSync(p, opt);
-    });
 
     // Advance timers to trigger pollInterval
     jest.advanceTimersByTime(1000);
@@ -152,6 +173,7 @@ describe('Agent Adapter Tests', () => {
 
     // Close child process
     mockChild.emit('close', 0);
+    jest.advanceTimersByTime(500);
 
     const result = await handle.promise;
     expect(result).toBe('This is the output from agent.');
@@ -172,17 +194,10 @@ describe('Agent Adapter Tests', () => {
 
     mockChild.stdout.emit('data', Buffer.from('{"conversationId": "conv_abc"}'));
 
-    (fs.existsSync as jest.Mock).mockImplementation((p) => {
-      if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
-        return true;
-      }
-      return actualFs.existsSync(p);
-    });
-
     const oldTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
     const newTime = new Date().toISOString();
 
-    const mockTranscriptLines = [
+    mockTranscriptContent = [
       JSON.stringify({
         type: 'PLANNER_RESPONSE',
         step_index: 0,
@@ -197,13 +212,6 @@ describe('Agent Adapter Tests', () => {
       })
     ].join('\n') + '\n';
 
-    (fs.readFileSync as jest.Mock).mockImplementation((p, opt) => {
-      if (typeof p === 'string' && p.endsWith('transcript.jsonl')) {
-        return mockTranscriptLines;
-      }
-      return actualFs.readFileSync(p, opt);
-    });
-
     jest.advanceTimersByTime(1000);
 
     expect(onEvent).not.toHaveBeenCalledWith(expect.objectContaining({
@@ -215,6 +223,7 @@ describe('Agent Adapter Tests', () => {
     });
 
     mockChild.emit('close', 0);
+    jest.advanceTimersByTime(500);
     await handle.promise;
   });
 
@@ -267,6 +276,7 @@ describe('Agent Adapter Tests', () => {
     });
 
     mockChild.emit('close', 0);
+    jest.advanceTimersByTime(500);
 
     await expect(handle.promise).resolves.toBe('1+1 等于 2。');
     expect(handle.isRunning()).toBe(false);
@@ -301,6 +311,7 @@ describe('Agent Adapter Tests', () => {
     });
 
     mockChild.emit('close', 0);
+    jest.advanceTimersByTime(500);
 
     await expect(handle.promise).resolves.toBe('你好！');
   });
@@ -332,6 +343,7 @@ describe('Agent Adapter Tests', () => {
     });
 
     mockChild.emit('close', 0);
+    jest.advanceTimersByTime(500);
 
     await expect(handle.promise).rejects.toThrow('Antigravity 当前未登录，CLI 无法获取模型授权。请先打开 Antigravity 或重新登录后再试。');
   });
@@ -351,6 +363,7 @@ describe('Agent Adapter Tests', () => {
     // Simulate child process stderr and crash
     mockChild.stderr.emit('data', Buffer.from('fatal error occurred'));
     mockChild.emit('close', 1);
+    jest.advanceTimersByTime(500);
 
     await expect(handle.promise).rejects.toThrow('Agent process exited with code 1. Stderr: fatal error occurred');
     expect(handle.isRunning()).toBe(false);
@@ -374,6 +387,7 @@ describe('Agent Adapter Tests', () => {
 
     // Simulate close after stop
     mockChild.emit('close', null);
+    jest.advanceTimersByTime(500);
 
     await expect(handle.promise).rejects.toThrow('Task cancelled by user /stop command.');
   });
