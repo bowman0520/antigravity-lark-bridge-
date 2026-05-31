@@ -685,10 +685,11 @@ export class LarkGateway {
       ? `用户在很短时间内连续发了 ${promptArr.length} 条消息，已合并为一次请求（按时间顺序，用空行分隔）。请把它们视为同一意图的补充/纠正，整体回复一次即可，不要逐条复述。`
       : '';
     const conversationText = session.conversationId || 'none';
+    const currentBotName = this.botName || '小G';
 
     return [
       '<bridge_context>',
-      'bot_name: 小G',
+      `bot_name: ${currentBotName}`,
       'channel: feishu',
       `scope: ${scope}`,
       `chat_id: ${scope.split(':')[1] || ''}`,
@@ -700,14 +701,14 @@ export class LarkGateway {
       'If <user_message> contains <quoted_message>, it is the quoted/replied message the user is asking about; answer based on it first and do not repeat the XML tags.',
       'If quoted_message contains <interactive_card_text> or <interactive_card_raw>, the user quoted a Feishu interactive card; prefer interactive_card_text and use raw JSON only as backup.',
       'If the user asks a quote-dependent question but the quoted content is empty or unreadable, say that the quoted body was unavailable; do not guess or read local files to infer it.',
-      '你叫小G，是通过飞书接入的 Antigravity 本地开发助手。',
+      `你叫${currentBotName}，是通过飞书接入的 Antigravity 本地开发助手。`,
       '默认使用中文回复，除非用户明确要求其他语言。',
       'bridge_context 是桥接层元数据，只用于理解上下文；不要在回复中复述这些字段。',
       '如果 user_message 里包含 <quoted_message>，它就是用户当前引用回复所指向的内容，必须优先围绕它回答；不要把 XML 标签原样复述给用户。',
       '如果 quoted_message 里包含 <interactive_card_text> 或 <interactive_card_raw>，说明用户引用的是飞书交互卡片；先根据 interactive_card_text 理解，必要时再参考 raw JSON。',
       '如果用户问“怎么看/这个呢”等依赖引用的问题，但引用内容为空、不可读或只有占位符，必须说明没有拿到引用正文；不要自行读取本地文件、不要猜测用户指的是哪个项目。',
       '当 <user_message> 内容很短或只是打招呼/确认/感叹（如 hi、你好、在吗、收到、好的、谢谢）时，只用一两句话简短回复，禁止主动调用任何工具。',
-      '当用户表达抱怨、疑问或闲聊（如"卡住了吗"、"什么情况"、"为啥还没好"、"能不能..."），先直接用对话回应；不要主动读代码、跑命令、翻 bridge 实现去排查，除非用户明确说"帮我看一下代码"或"调试一下"。',
+      '当用户表达抱怨、疑问或闲聊（如"卡住了吗"、"什么情况"、"为啥还没好"、"能不能..."），先直接用对话回应；不要主动读代码、跑命令、翻 bridge实现去排查，除非用户明确说"帮我看一下代码"或"调试一下"。',
       '【发送图片/文件/视频到飞书】生成或准备好本地文件后，必须用 lark-cli 主动发到当前对话，不要只在文本里写 ![](file://...)。命令模板：`lark-cli im +messages-send --chat-id <chat_id> --media-path <绝对路径>`，其中 chat_id 取自 bridge_context.chat_id。发完之后简短一句话告诉用户已发送即可，不要再贴本地路径。',
       shortReplyHint,
       chitChatHint,
