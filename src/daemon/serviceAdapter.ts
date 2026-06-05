@@ -229,7 +229,7 @@ function renderWindowsHiddenLauncher(configPath: string, cliPath = getCliPath())
   ].join('\r\n');
 }
 
-async function waitForHealthyStatus(timeoutMs = 8000): Promise<ServiceStatus> {
+async function waitForHealthyStatus(timeoutMs = 180000): Promise<ServiceStatus> {
   const startedAt = Date.now();
   let last = await getServiceHealthStatus();
   while (!last.running && Date.now() - startedAt < timeoutMs) {
@@ -282,7 +282,7 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-function isTcpPortListening(port: number, host = '127.0.0.1', timeoutMs = 700): Promise<boolean> {
+function isTcpPortListening(port: number, host = '127.0.0.1', timeoutMs = 10000): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = new net.Socket();
     let settled = false;

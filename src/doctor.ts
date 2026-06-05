@@ -42,7 +42,7 @@ export function runDoctor(configPath = CONFIG_FILE): DoctorCheck[] {
     message: `Node.js ${process.versions.node}${major >= 20 ? '' : ' is too old; Node.js 20+ is required.'}`,
   });
 
-  const agent = spawnSync(config.agent.command, ['--version'], { encoding: 'utf8', timeout: 5000 });
+  const agent = spawnSync(config.agent.command, ['--version'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
   checks.push({
     name: 'agent.command',
     status: agent.error ? 'fail' : 'ok',
