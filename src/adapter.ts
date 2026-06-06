@@ -124,29 +124,11 @@ export function runAgent(
   childEnv.CLAUDE_CONFIG_DIR = path.join(input.workspace, '.claude');
   childEnv.ANTIGRAVITY_APP_DATA_DIR = path.join(input.workspace, '.antigravitycli');
 
-  const child = process.platform === 'win32'
-    ? (() => {
-        // Windows 下为了彻底避免 agy.exe 内部启动子进程（如 git）时因父进程 No Console 而被迫弹窗的问题，
-        // 我们必须以 shell: true 的方式启动 cmd.exe 来为 agy 提供一个持久的隐藏控制台，
-        // 同时通过自定义拼接转义参数来规避 Node.js 的 DeprecationWarning 和潜在的安全转义漏洞。
-        const escapeCmdArg = (arg: string) => `"${arg.replace(/"/g, '\\"')}"`;
-        const escapedArgs = args.map(escapeCmdArg);
-        const escapedCommand = `"${config.agent.command}"`;
-        const fullCommand = `${escapedCommand} ${escapedArgs.join(' ')}`;
-        logger.info('agent.spawn_windows_shell', { command: fullCommand });
-        return spawn(fullCommand, {
-          cwd: input.workspace,
-          env: childEnv,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          shell: true,
-          windowsHide: true,
-        });
-      })()
-    : spawn(config.agent.command, args, {
-        cwd: input.workspace,
-        env: childEnv,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+  const child = spawn(config.agent.command, args, {
+    cwd: input.workspace,
+    env: childEnv,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
 
   if (typeof child.stdout?.setEncoding === 'function') {
     child.stdout.setEncoding('utf8');
