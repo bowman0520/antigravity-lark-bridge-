@@ -49,7 +49,7 @@ const ALLOWED_STEP_TYPES = new Set<string>([
 ]);
 
 const TRANSCRIPT_SIZE_WARN_THRESHOLD = 5 * 1024 * 1024;
-const FINAL_TEXT_IDLE_MS = 15 * 1000;
+const FINAL_TEXT_IDLE_MS = 3 * 1000;
 
 function getTranscriptPath(workspace: string, id: string): string {
   return path.join(getBrainDir(workspace), id, '.system_generated', 'logs', 'transcript.jsonl');
