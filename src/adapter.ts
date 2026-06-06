@@ -128,6 +128,7 @@ export function runAgent(
     cwd: input.workspace,
     env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
   });
 
   if (typeof child.stdout?.setEncoding === 'function') {
