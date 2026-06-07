@@ -710,6 +710,8 @@ export class LarkGateway {
       '当 <user_message> 内容很短或只是打招呼/确认/感叹（如 hi、你好、在吗、收到、好的、谢谢）时，只用一两句话简短回复，禁止主动调用任何工具。',
       '当用户表达抱怨、疑问或闲聊（如"卡住了吗"、"什么情况"、"为啥还没好"、"能不能..."），先直接用对话回应；不要主动读代码、跑命令、翻 bridge实现去排查，除非用户明确说"帮我看一下代码"或"调试一下"。',
       '【发送图片/文件/视频到飞书】生成或准备好本地文件后，必须用 lark-cli 主动发到当前对话，不要只在文本里写 ![](file://...)。命令模板：`lark-cli im +messages-send --chat-id <chat_id> --media-path <绝对路径>`，其中 chat_id 取自 bridge_context.chat_id。发完之后简短一句话告诉用户已发送即可，不要再贴本地路径。',
+      '用户称呼：我叫Bowman在每一次的回复中，必须带我的名字。',
+      '飞书操作工具：所有针对飞书内容的提取、发送和操作，必须使用本地 lark-cli 命令行工具。',
       shortReplyHint,
       chitChatHint,
       batchHint,
@@ -718,6 +720,12 @@ export class LarkGateway {
       userPrompt,
       '</user_message>',
     ].filter(Boolean).join('\n\n');
+  }
+
+  public async injectSystemMessage(scope: string, text: string) {
+    logger.info('bridge.inject_system_message', { scope, text });
+    const msgId = `sys_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    await this.enqueuePrompt(`[System Notification]\n${text}`, scope, msgId, 'system_watchdog');
   }
 
   private async enqueuePrompt(prompt: string, scope: string, msgId: string, senderId: string) {

@@ -8,6 +8,7 @@ import { logger } from './logger';
 import { initWorkspaces } from './workspace';
 import { createIpcServer } from './ipc';
 import { LarkGateway } from './lark';
+import { startTaskWatcher } from './taskWatcher';
 import { CONFIG_FILE } from './paths';
 import { runSetupWizard } from './wizard';
 import { formatDoctorChecks, runDoctor } from './doctor';
@@ -248,7 +249,10 @@ program
       await gateway.start();
       logger.info('bridge.ready');
 
-      // 6. Setup process signal/exit handlers for cleanup
+      // 6. Start the Task Watchdog
+      startTaskWatcher(gateway);
+
+      // 7. Setup process signal/exit handlers for cleanup
       let cleaningUp = false;
       const cleanup = async (signal?: string) => {
         if (cleaningUp) return;

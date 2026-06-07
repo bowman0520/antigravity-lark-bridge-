@@ -494,7 +494,7 @@ export function renderCard(state: RunState): object {
 
   if (state.terminal === 'done') {
     template = 'green';
-    titleText = 'Antigravity 任务已完成';
+    titleText = 'Antigravity 本轮回复完成';
   } else if (state.terminal === 'error') {
     template = 'red';
     titleText = 'Antigravity 任务失败';
