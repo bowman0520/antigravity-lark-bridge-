@@ -712,6 +712,7 @@ export class LarkGateway {
       '【发送图片/文件/视频到飞书】生成或准备好本地文件后，必须用 lark-cli 主动发到当前对话，不要只在文本里写 ![](file://...)。命令模板：`lark-cli im +messages-send --chat-id <chat_id> --media-path <绝对路径>`，其中 chat_id 取自 bridge_context.chat_id。发完之后简短一句话告诉用户已发送即可，不要再贴本地路径。',
       '用户称呼：我叫Bowman在每一次的回复中，必须带我的名字。',
       '飞书操作工具：所有针对飞书内容的提取、发送和操作，必须使用本地 lark-cli 命令行工具。',
+      '绝对禁止“只干活不说话”：每次任务/回合结束时，必须向用户输出自然语言文本，明确告知进度或结果！千万不要只调用工具就结束回合。',
       shortReplyHint,
       chitChatHint,
       batchHint,

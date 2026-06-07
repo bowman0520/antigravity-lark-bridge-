@@ -530,8 +530,15 @@ export function renderCard(state: RunState): object {
     elements.push(noteMd(`_⏱ ${mins} 分钟无响应，已自动终止_`));
   } else if (state.terminal === 'error' && state.errorMsg) {
     elements.push(noteMd(`⚠️ agent 失败：${state.errorMsg}`));
-  } else if (state.terminal === 'done' && elements.length === 0) {
-    elements.push(noteMd('_（未返回内容）_'));
+  } else if (state.terminal === 'done') {
+    const hasText = state.blocks.some((b) => b.kind === 'text' && b.content.trim());
+    if (!hasText) {
+      if (elements.length === 0) {
+        elements.push(noteMd('_（未返回内容）_'));
+      } else {
+        elements.push(noteMd('⚠️ _Agent 未输出任何直接回复文本。_'));
+      }
+    }
   }
 
   // 5. Active controls (running only)
